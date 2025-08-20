@@ -1,0 +1,16 @@
+Top trades with PnL scenarios (first 10):
+kraken_pair side  entry_price           qty  take_profit     stop  pnl_if_tp_usd  pnl_if_stop_usd
+     WIFUSD  buy     0.828500      9.051412     0.831100 0.827200       0.014511        -0.020754
+     WIFUSD sell     0.828700      9.051412     0.826100 0.830000       0.014556        -0.020780
+    BONKUSD  buy     0.000021 350238.161950     0.000021 0.000021       0.009896        -0.018445
+    BONKUSD sell     0.000021 350238.161950     0.000021 0.000021       0.009930        -0.018468
+    PEPEUSD  buy     0.000010 734394.124847     0.000010 0.000010       0.009344        -0.018535
+    PEPEUSD sell     0.000010 734394.124847     0.000010 0.000010       0.009376        -0.018559
+   FLOKIUSD  buy     0.000098  76565.769996     0.000098 0.000098       0.012422        -0.019703
+   FLOKIUSD sell     0.000098  76565.769996     0.000098 0.000098       0.012455        -0.019735
+     SUIUSD  buy     3.452600      2.171710     3.460500 3.448600       0.008142        -0.017676
+     SUIUSD sell     3.454400      2.171710     3.446500 3.458400       0.008171        -0.017698
+
+Totals: {'total_pnl_if_tp_usd': 0.15834123993271612, 'total_pnl_if_stop_usd': -0.269296822994545, 'num_trades': 14}
+
+Files saved to ./output/: screen_latest.csv, trade_tickets_latest.csv, pnl_summary_latest.csv
