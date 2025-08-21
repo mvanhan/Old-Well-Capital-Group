@@ -16,14 +16,16 @@ def list_asset_pairs():
     return _get("/AssetPairs")
 
 def find_usd_pairs_for_symbol(symbol_hint: str):
-    res = list_asset_pairs()
+    """Return list of altname pairs like ['WIFUSD', 'BONKUSD'] where base ~ symbol_hint and quote USD."""
     out = []
-    for k, v in res.items():
-        alt = v.get("altname") or k
-        if symbol_hint.upper() in alt.upper():
-            if alt.upper().endswith("USD") or alt.upper().endswith("ZUSD"):
-                out.append(alt)
-    return sorted(list(set(out)))
+    res = list_asset_pairs()
+    hint = symbol_hint.upper()
+    for _, v in res.items():
+        alt = v.get("altname") or ""
+        wsname = v.get("wsname") or ""
+        if alt.endswith("USD") and (alt.startswith(hint) or wsname.upper().startswith(hint)):
+            out.append(alt)
+    return sorted(set(out))
 
 def ticker_info(pair: str):
     res = _get("/Ticker", {"pair": pair})
@@ -35,8 +37,8 @@ def order_book(pair: str, count: int = 50):
 
 def pair_decimals(pair: str) -> int:
     res = list_asset_pairs()
-    for k, v in res.items():
-        alt = v.get("altname") or k
+    for _, v in res.items():
+        alt = v.get("altname") or ""
         if alt == pair:
             return int(v.get("pair_decimals", 2))
     return 2
