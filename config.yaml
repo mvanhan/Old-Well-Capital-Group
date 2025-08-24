@@ -6,6 +6,7 @@ general:
 live:
   # Turn OFF paper trading for this test
   dry_run: false
+  # dry_run: true
 
 screen:
   take: 1 # only place one trade candidate
