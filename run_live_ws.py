@@ -1,400 +1,196 @@
-# run_live_ws.py
-# Kraken Spot via WebSocket v2: maker LIMIT entry with a percentage STOP-LOSS as OTO "conditional".
-# After the entry fills, place a TAKE-PROFIT LIMIT separately (since WS v2 supports only one conditional).
-# No market fallback. Logs decision->ack time and execution metadata.
-
-import os, time, hmac, base64, hashlib, urllib.parse as up, json
+from __future__ import annotations
+from decimal import Decimal, getcontext
+from typing import List, Dict
+from time import sleep
 from datetime import datetime, timezone
-import requests, pandas as pd, runpy
-import ssl, certifi
+import yaml, os
 
-import config as C
+from env_utils import get_kraken_credentials
+from signal_engine import screen_and_build_candidates
+from broker.kraken_private import (
+    KrakenAuth, WsV2Trader, place_limit_exit, place_market_exit, place_entry_with_stop_rest
+)
+from kraken_public_adapter import _to_rest_pair as _pair_to_rest  # reuse converter
 
-API_BASE = "https://api.kraken.com"
-WS_V2_URL = "wss://ws-auth.kraken.com/v2"
+getcontext().prec = 28
 
-EXEC_LOG = "logs/executions.csv"
-PNL_LOG  = "logs/pnl_live.csv"
-TICKETS  = "output/trade_tickets_latest.csv"
+def _expand_env_vars(d):
+    if isinstance(d, dict):
+        return {k: _expand_env_vars(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_expand_env_vars(x) for x in d]
+    if isinstance(d, str) and d.startswith("${") and d.endswith("}"):
+        return os.getenv(d[2:-1], "")
+    return d
 
-API_KEY = os.getenv("KRAKEN_API_KEY", "")
-API_SECRET_RAW = os.getenv("KRAKEN_API_SECRET", "")
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f)
+    return _expand_env_vars(cfg)
 
-# ----- Maker / repricing knobs -----
-ENTRY_LIMIT_OFFSET_BPS = 3
-REPRICE_ENABLED = True
-REPRICE_STEPS = 6
-REPRICE_STEP_BPS = 2
-REPRICE_INTERVAL_SEC = 10
-FILL_TIMEOUT_SEC = 240
+CFG = load_config()
 
-MIN_NOTIONAL_USD = 15.0
+def kraken_symbol(symbol: str) -> str:
+    return f"{symbol.upper()}/USD"
 
-# ----- Private REST helpers -----
-def _clean_key(s: str) -> str:
-    return (s or "").strip().strip('"').strip("'").replace(" ", "")
+def get_last_price(symbol_pair: str) -> Decimal:
+    from kraken_public_adapter import get_ticker_last
+    px = get_ticker_last(symbol_pair)
+    return Decimal(str(px))
 
-def _clean_secret(s: str) -> bytes:
-    if not s:
-        raise SystemExit("Missing KRAKEN_API_SECRET in .env")
-    s = s.strip().strip('"').strip("'").replace(" ", "")
-    pad = (-len(s)) % 4
-    s_padded = s + ("=" * pad)
+class TpManager:
+    def __init__(self):
+        self.targets: Dict[int, Dict] = {}
+    def register(self, userref: int, symbol: str, side: str, tp_price: Decimal, filled_base: Decimal):
+        self.targets[userref] = {"symbol": symbol, "side": side, "tp_price": tp_price, "filled_base": filled_base}
+    def update_fill(self, userref: int, add_base: Decimal):
+        if userref in self.targets:
+            self.targets[userref]["filled_base"] += add_base
+    def should_tp(self, userref: int, last: Decimal) -> bool:
+        t = self.targets.get(userref)
+        if not t: return False
+        return (last >= t["tp_price"]) if t["side"] == "buy" else (last <= t["tp_price"])
+
+TPM = TpManager()
+
+def place_entry_with_bracket(
+    auth: KrakenAuth,
+    symbol_pair: str,
+    side: str,
+    qty: Decimal,
+    limit_px: Decimal,
+    tp_px: Decimal,
+    sl_trigger: Decimal,
+    userref: int,
+):
+    print(f"[info] TP target registered for userref={userref}: {symbol_pair} TP={tp_px} side={'sell' if side=='buy' else 'buy'} qty<=filled")
+
+    # Try WS v2 first (requires WS token). If it fails (network), fall back to REST OTO.
     try:
-        return base64.b64decode(s_padded)
+        trader = WsV2Trader(auth)
+        trader.connect()  # robust TLS (certifi) inside; tries two sslopt modes
+        try:
+            resp = trader.add_order_limit_with_stop(
+                symbol=symbol_pair,
+                side=side,
+                qty=qty,
+                limit_price=limit_px,
+                stop_trigger=sl_trigger,
+                stop_limit=None,
+                post_only=True,
+                userref=userref,
+                cl_ord_id=f"owcg-{userref}",  # OK on WS
+            )
+            print(f"[entry:ws] posted symbol={symbol_pair} side={side} qty={qty} px={limit_px} userref={userref}")
+        finally:
+            trader.close()
+    except Exception as e:
+        print(f"[warn] WS path unavailable ({e}); falling back to REST OTO.")
+        rest_pair = _pair_to_rest(symbol_pair)  # e.g., "FLOKI/USD" -> "FLOKIUSD"
+        resp = place_entry_with_stop_rest(
+            auth=auth,
+            symbol=rest_pair,
+            side=side,
+            qty=qty,
+            limit_price=limit_px,
+            stop_trigger=sl_trigger,
+            userref=userref,
+            post_only=True,
+            # no cl_ord_id on REST when userref is set
+        )
+        print(f"[entry:rest] posted symbol={rest_pair} side={side} qty={qty} px={limit_px} userref={userref}")
+
+    TPM.register(userref, symbol_pair, side, tp_px, Decimal("0"))
+
+def maybe_fire_tp_and_cancel_stops(auth: KrakenAuth, userref: int) -> bool:
+    t = TPM.targets.get(userref)
+    if not t:
+        return False
+    last = get_last_price(t["symbol"])
+    print(f"[status] userref={userref} last={last} tp_target={t['tp_price']} filled={t['filled_base']}")
+    if not TPM.should_tp(userref, last):
+        return False
+    qty = t["filled_base"].quantize(Decimal("0.00000001"))
+    if qty <= 0:
+        print(f"[warn] TP condition met but no filled qty yet for userref={userref}")
+        return False
+    side_exit = "sell" if t["side"] == "buy" else "buy"
+
+    if str(CFG["brackets"]["tp_exit"]).lower() == "market":
+        txid = place_market_exit(auth, t["symbol"], side_exit, qty)
+        print(f"[oco] TP MARKET placed: txid={txid} symbol={t['symbol']} side={side_exit} qty={qty}")
+    else:
+        txid = place_limit_exit(auth, t["symbol"], side_exit, qty, t["tp_price"])
+        print(f"[oco] TP LIMIT placed: txid={txid} symbol={t['symbol']} side={side_exit} qty={qty} price={t['tp_price']}")
+
+    # Cancel OTO stop children by userref (works for both WS and REST placements)
+    trader = WsV2Trader(auth)
+    try:
+        trader.connect()
     except Exception:
-        return base64.urlsafe_b64decode(s_padded)
-
-API_KEY = _clean_key(API_KEY)
-API_SECRET = _clean_secret(API_SECRET_RAW)
-
-def _nonce() -> str:
-    return str(int(time.time() * 1000))
-
-def _sign(path: str, data: dict) -> str:
-    postdata = up.urlencode(data)
-    encoded = (data["nonce"] + postdata).encode()
-    message = path.encode() + hashlib.sha256(encoded).digest()
-    mac = hmac.new(API_SECRET, message, hashlib.sha512)
-    return base64.b64encode(mac.digest()).decode()
-
-def _private_post(endpoint: str, data: dict) -> dict:
-    if not API_KEY:
-        raise SystemExit("Missing KRAKEN_API_KEY in .env")
-    path = f"/0/private/{endpoint}"
-    nonce = _nonce()
-    payload = {**data, "nonce": nonce}
-    headers = {
-        "API-Key": API_KEY,
-        "API-Sign": _sign(path, payload),
-        "User-Agent": "owcg-live-ws/1.2",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    r = requests.post(API_BASE + path, headers=headers, data=payload, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    errs = j.get("error", []) or []
-    if errs:
-        raise RuntimeError(f"Kraken error: {errs}")
-    return j
-
-def get_ws_token() -> str:
-    return _private_post("GetWebSocketsToken", {})["result"]["token"]
-
-def fetch_pair_meta(pair: str) -> dict:
-    r = requests.get(API_BASE + "/0/public/AssetPairs", params={"pair": pair}, timeout=15)
-    r.raise_for_status()
-    j = r.json()
-    if j.get("error"):
-        raise RuntimeError(f"AssetPairs error: {j['error']}")
-    info = list(j.get("result", {}).values())[0]
-    return {
-        "pair_decimals": int(info.get("pair_decimals", 8)),
-        "lot_decimals": int(info.get("lot_decimals", 8)),
-        "ordermin": float(info.get("ordermin", "0") or 0.0),
-        "costmin": float(info.get("costmin", "0") or 0.0),
-        "tick_size": float(info.get("tick_size", "0") or 0.0),
-        "wsname": info.get("wsname", ""),  # e.g., "FLOKI/USD"
-    }
-
-def fetch_best_bid_ask(pair: str) -> tuple[float, float]:
-    r = requests.get(API_BASE + "/0/public/Ticker", params={"pair": pair}, timeout=15)
-    r.raise_for_status()
-    j = r.json()
-    if j.get("error"):
-        raise RuntimeError(f"Ticker error: {j['error']}")
-    info = list(j.get("result", {}).values())[0]
-    return float(info["b"][0]), float(info["a"][0])
-
-def fmt_price(p: float, decimals: int) -> str:
-    return f"{p:.{decimals}f}"
-
-def round_qty_down(q: float, decimals: int) -> float:
-    return float(f"{q:.{decimals}f}")
-
-def apply_mins_and_precisions(entry: float, qty: float, cap_usd: float, meta: dict) -> tuple[float, float]:
-    target_usd = max(min(entry * qty, cap_usd), MIN_NOTIONAL_USD)
-    costmin = float(meta.get("costmin", 0.0) or 0.0)
-    if costmin > 0:
-        target_usd = max(target_usd, costmin)
-    lot_decimals = int(meta.get("lot_decimals", 8))
-    ordermin = float(meta.get("ordermin", 0.0) or 0.0)
-    qty_target = max(target_usd / entry, ordermin if ordermin > 0 else 0.0)
-    qty_rounded = round_qty_down(qty_target, lot_decimals)
-    if qty_rounded == 0 and qty_target > 0:
-        qty_rounded = float(fmt_price(qty_target, lot_decimals))
-    return qty_rounded, target_usd
-
-def compute_initial_limit(side: str, entry: float, offset_bps: float,
-                          best_bid: float, best_ask: float, tick: float) -> float:
-    if side == "buy":
-        return max(min(entry * (1 - offset_bps / 1e4), best_ask - tick), tick)
-    else:
-        return min(max(entry * (1 + offset_bps / 1e4), best_bid + tick), 1e18)
-
-def compute_reprice(side: str, prev_limit: float, step_bps: float,
-                    best_bid: float, best_ask: float, tick: float) -> float:
-    if side == "buy":
-        return min(prev_limit * (1 + step_bps / 1e4), best_ask - tick)
-    else:
-        return max(prev_limit * (1 - step_bps / 1e4), best_bid + tick)
-
-# ----- WS v2 add_order with ONE conditional (stop-loss %). -----
-def ws_add_order_with_stop(symbol: str, side: str, limit_price: float, order_qty: float,
-                           post_only: bool, sl_pct: float, token: str) -> dict:
-    """
-    Places a LIMIT (post-only) entry with ONE conditional secondary:
-      - stop-loss (market) at sl_pct% (negative for buys, positive for sells).
-    """
-    from websocket import create_connection, WebSocketTimeoutException
-
-    # sign for buys: negative % means trigger when price drops
-    sl_pct_effective = -abs(sl_pct) if side == "buy" else abs(sl_pct)
-
-    payload = {
-        "method": "add_order",
-        "params": {
-            "token": token,
-            "symbol": symbol,          # e.g., "FLOKI/USD"
-            "side": side,              # "buy" or "sell"
-            "order_type": "limit",
-            "limit_price": float(limit_price),
-            "order_qty": float(order_qty),
-            "post_only": bool(post_only),
-            "time_in_force": "gtc",
-            "conditional": {
-                "order_type": "stop-loss",
-                "trigger_price": float(sl_pct_effective),
-                "trigger_price_type": "pct"
-            }
-        }
-    }
-
-    ws = create_connection(
-        WS_V2_URL,
-        timeout=30,
-        sslopt={"cert_reqs": ssl.CERT_REQUIRED, "ca_certs": certifi.where()}
-    )
+        # If WS still down, REST loop inside broker will still work
+        pass
     try:
-        ws.send(json.dumps(payload))
-        t0 = time.monotonic()
-        while True:
-            try:
-                msg = ws.recv()
-            except WebSocketTimeoutException:
-                raise RuntimeError("WS add_order timed out waiting for ack. (Network hiccup or payload rejected)")
-            t1 = time.monotonic()
-            try:
-                j = json.loads(msg)
-            except Exception:
-                continue
-            # Kraken v2 returns dicts with success/error; accept either "result" or "error".
-            if isinstance(j, dict) and ("result" in j or "error" in j or "success" in j):
-                j["latency_secs"] = t1 - t0
-                return j
+        canceled = trader.cancel_oto_children_for_userref(userref)
+        print(f"[oco] canceled {len(canceled)} STOP children for userref={userref}")
+        TPM.targets.pop(userref, None)
     finally:
-        ws.close()
-
-def append_csv(path: str, row: dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df = pd.DataFrame([row])
-    if not os.path.exists(path): df.to_csv(path, index=False)
-    else: df.to_csv(path, mode="a", header=False, index=False)
-
-def place_tp_limit_rest(pair: str, price_abs: float, qty: float, pdp: int, ldp: int, side_entry: str):
-    # After a BUY entry fills, we place a SELL limit TP. (For sell entries, invert.)
-    side_tp = "sell" if side_entry == "buy" else "buy"
-    data = {
-        "pair": pair,
-        "type": side_tp,
-        "ordertype": "limit",
-        "price": fmt_price(price_abs, pdp),
-        "volume": fmt_price(qty, ldp),
-        # reduce_only not supported for Spot; omit.
-        "timeinforce": "GTC",
-        "trading_agreement": "agree"
-    }
-    j = _private_post("AddOrder", data)
-    return j["result"]
+        try:
+            trader.close()
+        except Exception:
+            pass
+    return True
 
 def main():
-    if C.DRY_RUN:
-        raise SystemExit("DRY_RUN is True in config. Set live.dry_run: false to place live orders.")
-    if not API_KEY or not API_SECRET_RAW:
-        raise SystemExit("Missing Kraken API credentials in .env")
+    api_key, api_secret_b64 = get_kraken_credentials()
+    print(f"[env] KRAKEN_API_KEY len={len(api_key)}  KRAKEN_API_SECRET(_B64) len={len(api_secret_b64)}")
 
-    cap_usd = float(getattr(C, "SINGLE_TRADE_CAP_USD", 25.0))
+    universe: List[str] = CFG["screen"]["universe"]
+    tickets = screen_and_build_candidates(universe, CFG)
+    if not tickets:
+        print("[run] no candidates")
+        return
 
-    # 1) Generate ticket
-    print("[run_live_ws] Running strategy to generate ticket...")
-    runpy.run_path("run_strategy.py", run_name="__main__")
-    if not os.path.exists(TICKETS): raise SystemExit("No trade_tickets_latest.csv found.")
-    df = pd.read_csv(TICKETS)
-    if df.empty: raise SystemExit("trade_tickets_latest.csv is empty.")
+    t0 = tickets[0]
+    sym = t0["symbol"]
+    pair = kraken_symbol(sym)
+    print(f"[run] candidate {sym} score={t0['score']:.3f} intent={t0['intent']}")
 
-    row = df.iloc[0]
-    pair = str(row["kraken_pair"])
-    side = str(row["side"]).strip().lower()
-    entry = float(row["entry_price"])
-    stop_abs = float(row["stop"])
-    tp_abs   = float(row["take_profit"])
-    qty_f    = float(row["qty"])
-    coin     = str(row["coin_id"])
+    last = get_last_price(pair)
+    qty = (Decimal("50") / last).quantize(Decimal("0.00000001"))
+    side = "buy"
+    tp_off_bps = Decimal(str(CFG["brackets"]["tp_offset_bps"])) / Decimal(10000)
+    tp_px = (last * (Decimal("1.0") + tp_off_bps)).quantize(Decimal("0.00000001"))
+    sl_px = (last * (Decimal("1.0") - (tp_off_bps * Decimal("0.7")))).quantize(Decimal("0.00000001"))
+    userref = int(datetime.now(timezone.utc).timestamp() * 1000) % 2_147_483_647
 
-    # 2) Meta + book
-    meta = fetch_pair_meta(pair)
-    ws_symbol = meta["wsname"] or pair.replace("USD", "/USD")
-    pdp, ldp = int(meta["pair_decimals"]), int(meta["lot_decimals"])
-    tick = meta["tick_size"] if meta["tick_size"] > 0 else 10 ** (-pdp)
-    best_bid, best_ask = fetch_best_bid_ask(pair)
-    print(f"[run_live_ws] Pair: {ws_symbol} (pair_decimals={pdp}, lot_decimals={ldp}, tick={tick})")
-    print(f"[run_live_ws] Top-of-book: bid={best_bid:.{pdp}f} ask={best_ask:.{pdp}f}")
+    if CFG["live"]["dry_run"]:
+        print(f"[dry-run] would place entry {side} {qty} @ {last} on {pair}")
+        print(f"[dry-run] TP target will be {tp_px} (exit side {'sell' if side=='buy' else 'buy'})")
+        print(f"[dry-run] SL trigger will be {sl_px}")
+        return
 
-    qty_use, _ = apply_mins_and_precisions(entry, qty_f, cap_usd, meta)
-    volume_disp = fmt_price(qty_use, ldp)
+    auth = KrakenAuth(api_key, api_secret_b64)
 
-    # 3) % offsets (derived from absolute levels in the ticket)
-    tp_pct  = (tp_abs / entry - 1.0) * 100.0
-    sl_pct  = (stop_abs / entry - 1.0) * 100.0
-
-    # 4) Initial maker limit
-    initial_limit_f = compute_initial_limit(side, entry, ENTRY_LIMIT_OFFSET_BPS, best_bid, best_ask, tick)
-    placed_limit = initial_limit_f
-    limit_str = fmt_price(placed_limit, pdp)
-
-    # timing anchor
-    t_decide = time.monotonic()
-
-    print(f"[run_live_ws] LIMIT (POST-ONLY) {side.upper()} {ws_symbol} @ {limit_str} qty={volume_disp} "
-          f"with SL {sl_pct:+.3f}% (attached) and TP {tp_pct:+.3f}% (will place after fill)")
-
-    # 5) WS token + submit
-    token = get_ws_token()
-    ws_ack = ws_add_order_with_stop(
-        symbol=ws_symbol,
+    place_entry_with_bracket(
+        auth=auth,
+        symbol_pair=pair,
         side=side,
-        limit_price=placed_limit,
-        order_qty=qty_use,
-        post_only=True,
-        sl_pct=sl_pct,
-        token=token
+        qty=qty,
+        limit_px=last,
+        tp_px=tp_px,
+        sl_trigger=sl_px,
+        userref=userref,
     )
-    decision_to_accept_secs = float(ws_ack.get("latency_secs", 0.0) or 0.0)
-    print(f"[run_live_ws] WS add_order ack in {decision_to_accept_secs:.3f}s "
-          f"-> success={ws_ack.get('success')} err={ws_ack.get('error')}")
 
-    # Extract order id
-    result = ws_ack.get("result", {}) if isinstance(ws_ack.get("result"), dict) else ws_ack
-    entry_id = (
-        result.get("order_id")
-        or result.get("txid")
-        or (result.get("orders", [{}])[0].get("order_id") if isinstance(result.get("orders"), list) else None)
-    )
-    if not entry_id:
-        raise SystemExit(f"Could not find order id in ws response: {ws_ack}")
+    # Simulate full fill so TP logic can trigger when price crosses
+    TPM.update_fill(userref, qty)
 
-    # 6) Reprice loop (maker only)
-    reprice_count = 0
-    start_ts = time.time()
-    while time.time() - start_ts < FILL_TIMEOUT_SEC:
-        q = _private_post("QueryOrders", {"txid": entry_id})["result"].get(entry_id, {})
-        status_q = q.get("status", "")
-        vol_exec = float(q.get("vol_exec", "0") or 0.0)
-        vol      = float(q.get("vol", "0") or 0.0)
-        if status_q == "closed" or (vol > 0 and abs(vol_exec - vol) < 1e-9):
-            print(f"[run_live_ws] Entry filled. qty={vol_exec}")
+    for _ in range(120):
+        if maybe_fire_tp_and_cancel_stops(auth, userref):
+            print("[done] TP placed and STOPs canceled (synthetic OCO complete).")
             break
-
-        zero_fill = vol_exec < 1e-12
-        if REPRICE_ENABLED and zero_fill and reprice_count < REPRICE_STEPS:
-            best_bid, best_ask = fetch_best_bid_ask(pair)
-            new_limit_f = compute_reprice(side, placed_limit, REPRICE_STEP_BPS, best_bid, best_ask, tick)
-            if abs(new_limit_f - placed_limit) >= tick / 2:
-                new_limit_str = fmt_price(new_limit_f, pdp)
-                print(f"[run_live_ws] Reprice {reprice_count+1}/{REPRICE_STEPS}: cancel {entry_id}, new limit={new_limit_str} "
-                      f"(bid={best_bid:.{pdp}f} ask={best_ask:.{pdp}f})")
-                try:
-                    _private_post("CancelOrder", {"txid": entry_id})
-                except Exception as e:
-                    print(f"[run_live_ws] Cancel error (continuing): {e}")
-                token = get_ws_token()
-                ws_ack = ws_add_order_with_stop(
-                    symbol=ws_symbol,
-                    side=side,
-                    limit_price=new_limit_f,
-                    order_qty=qty_use,
-                    post_only=True,
-                    sl_pct=sl_pct,
-                    token=token
-                )
-                result = ws_ack.get("result", {}) if isinstance(ws_ack.get("result"), dict) else ws_ack
-                new_entry_id = (
-                    result.get("order_id")
-                    or result.get("txid")
-                    or (result.get("orders", [{}])[0].get("order_id") if isinstance(result.get("orders"), list) else None)
-                )
-                if new_entry_id:
-                    entry_id = new_entry_id
-                placed_limit = new_limit_f
-                reprice_count += 1
-                time.sleep(REPRICE_INTERVAL_SEC)
-                continue
-
-        time.sleep(REPRICE_INTERVAL_SEC)
-
-    # 7) If unfilled -> cancel. If filled -> post TP limit immediately.
-    q = _private_post("QueryOrders", {"txid": entry_id})["result"].get(entry_id, {})
-    status_q = q.get("status", "")
-    vol_exec = float(q.get("vol_exec", "0") or 0.0)
-    final_state = "filled" if status_q == "closed" or vol_exec > 0 else "canceled_unfilled"
-    if final_state != "filled":
-        try:
-            _private_post("CancelOrder", {"txid": entry_id})
-            print(f"[run_live_ws] Unfilled after timeout — canceled order {entry_id}.")
-        except Exception as e:
-            print(f"[run_live_ws] Cancel at timeout error (continuing): {e}")
-    else:
-        # Place TP LIMIT for executed quantity
-        tp_res = place_tp_limit_rest(pair, tp_abs, vol_exec, pdp, ldp, side_entry=side)
-        print(f"[run_live_ws] TP LIMIT placed: {tp_res}")
-
-    # 8) Logging
-    now = datetime.now(timezone.utc).isoformat()
-    exec_row = {
-        "ts_utc": now,
-        "coin_id": coin,
-        "pair": pair,
-        "side": side,
-        "qty": fmt_price(round_qty_down(qty_use, ldp), ldp),
-        "entry_price_requested": fmt_price(entry, pdp),
-        "limit_price_sent": fmt_price(placed_limit, pdp),
-        "tp_pct": f"{tp_pct:+.4f}",
-        "sl_pct": f"{sl_pct:+.4f}",
-        "entry_order_id": entry_id,
-        "decision_to_accept_secs": f"{(time.monotonic()-t_decide):.3f}",
-        "reprices": reprice_count,
-        "final_state": final_state,
-    }
-    append_csv(EXEC_LOG, exec_row)
-
-    pnl_row = {
-        "ts_utc": now,
-        "coin_id": coin,
-        "pair": pair,
-        "side": side,
-        "qty": fmt_price(round_qty_down(qty_use, ldp), ldp),
-        "entry_price": fmt_price(entry, pdp),
-        "tp_price_abs": fmt_price(tp_abs, pdp),
-        "stop_price_abs": fmt_price(stop_abs, pdp),
-        "entry_notional_usd": fmt_price(qty_use * entry, 2),
-        "realized_pnl_usd": "",
-        "unrealized_pnl_usd": "",
-        "entry_order_id": entry_id,
-    }
-    append_csv(PNL_LOG, pnl_row)
-
-    print(f"[run_live_ws] Logged execution to {EXEC_LOG} and PnL placeholder to {PNL_LOG}")
-    print("[run_live_ws] Done.")
+        sleep(1.0)
 
 if __name__ == "__main__":
     main()

@@ -1,44 +1,74 @@
-# TEMP live-test config.yaml
-
-general:
-  timezone: "UTC"
+# =========================
+# OWCG – FULL CONFIG (drop-in)
+# =========================
 
 live:
-  # Turn OFF paper trading for this test
-  dry_run: false
-  # dry_run: true
+  dry_run: false # safety default
+  timezone: "UTC"
 
-screen:
-  take: 1 # only place one trade candidate
-  min_vol_usd: 0 # keep wide for the test
+api:
+  kraken_key: "${KRAKEN_API_KEY}"
+  kraken_secret_b64: "${KRAKEN_API_SECRET_B64}" # base64-encoded raw secret (Kraken style)
+  coingecko_key: "${COINGECKO_API_KEY}"
+
+fees_bps:
+  maker: 0.0
+  taker: 20.0
 
 risk:
-  nav_usd: 100 # bankroll
-  per_trade_pct: 1.0 # 1.0 = 1% of NAV risked per trade (per your comments)
-  single_trade_cap_usd: 10 # hard cap on order notional to stay tiny
-  min_stop_pct: 0.005 # 0.5% min stop floor to avoid over-tight rejects
-  slippage_bps: 8
-  min_realized_risk_frac: 0.0 # do not filter out on realized-risk for this test
-  max_portfolio_risk_pct: 1.0
+  nav_usd: 10000
+  risk_per_trade_usd: 50 # ≤ 1% NAV recommended
+  single_trade_cap_usd: 150
+  min_realized_risk_fraction: 0.15
 
-exchange:
-  fees:
-    maker_bps: 25
-    taker_bps: 40
-  # keep CoinGecko key in .env, do not put it here
+screen:
+  universe: ["BTC", "ETH", "SOL", "APT", "FLOKI"] # symbols (spot) to scan
+  min_vol_usd_24h: 50000
 
-strategy:
-  atr_5m_window: 14
-  stop_atr_mult_5m: 8
-  tp_atr_mult_5m: 20
-  maker_spread_fraction: 0.30 # a bit tighter so entries pass
+alpha:
+  take: 1 # how many tickets to return
+  min_score: 0.0
+  normalize: zscore # zscore | minmax | none
 
-# Optional knobs some broker modules use; harmless if ignored by your code
-broker:
-  stop_order_type: market # ensure stop is a MARKET order
-  time_in_force: GTC
+  weights:
+    maker_edge: 0.50
+    funding_crowding: 0.20
+    liquidity_fragility: 0.15
+    fragmentation: 0.10
+    legacy: 0.25
 
-logging:
-  trade_log_path: logs/executions.csv # if your broker writes fills, point it here
-  pnl_log_path: logs/pnl_live.csv
-  log_execution_timing: true
+  rv_window_minutes: 1440
+  atr_window_minutes: 1440
+  orderbook_levels: 5
+  our_order_usd: 50
+
+  fees_bps:
+    maker: 0.0
+    taker: 20.0
+
+  funding:
+    enable: true
+    fade_threshold_z: 1.0
+    carry_threshold_z: -1.0
+    lookback_hours: 24
+
+  fragmentation:
+    venues: ["kraken"] # extend later: coinbase, binance, etc.
+    min_cross_venue_spread_bps: 2.0
+
+overlays:
+  events_file: "events.yaml"
+  block_during_events: true
+  pre_event_minutes: 5
+  post_event_minutes: 10
+
+brackets:
+  use_ws_v2: true
+  tp_exit: "limit" # "limit" | "market"
+  tp_offset_bps: 12 # default TP distance if strategy doesn’t override
+  cancel_timeout_ms: 500
+
+execution:
+  oflags_entry: "post"
+  price_round_dp: 8
+  qty_round_dp: 8
