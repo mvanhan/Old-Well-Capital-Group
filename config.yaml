@@ -16,9 +16,9 @@ fees_bps:
   taker: 20.0
 
 risk:
-  nav_usd: 10000
-  risk_per_trade_usd: 50 # ≤ 1% NAV recommended
-  single_trade_cap_usd: 150
+  nav_usd: 10000 # keep as-is (or your real NAV)
+  per_trade_pct: 0.0005 # 0.05% of NAV (5 bps) → very small risk driver
+  single_trade_cap_usd: 10
   min_realized_risk_fraction: 0.15
 
 screen:

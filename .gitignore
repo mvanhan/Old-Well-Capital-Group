@@ -1,5 +1,16 @@
-# .gitignore
-.env
+
+# Python
 __pycache__/
-output/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+
+# OS
+.DS_Store
+
+# Project
 logs/
+output/*.csv

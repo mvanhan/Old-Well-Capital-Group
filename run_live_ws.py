@@ -1,196 +1,321 @@
+# run_live_ws.py — Entry + attached stop-loss-limit + independent TP + WS v2 OCO
 from __future__ import annotations
-from decimal import Decimal, getcontext
-from typing import List, Dict
-from time import sleep
+import json
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import yaml, os
+from decimal import Decimal, getcontext
+from typing import Optional, Dict
 
-from env_utils import get_kraken_credentials
-from signal_engine import screen_and_build_candidates
+import websocket  # websocket-client
+import ssl, certifi  # TLS root CA bundle
+
+import config as C
 from broker.kraken_private import (
-    KrakenAuth, WsV2Trader, place_limit_exit, place_market_exit, place_entry_with_stop_rest
+    KrakenAuth,
+    place_entry_with_stop_rest,
+    place_limit_order,
+    cancel_order,
+    get_balance,            # <-- new: read balances to compute free base
 )
-from kraken_public_adapter import _to_rest_pair as _pair_to_rest  # reuse converter
+from kraken_public import (
+    ticker_info,
+    pair_decimals,
+    ordermin_for_pair,      # <-- new: enforce TP >= ordermin
+    base_asset_for_pair,    # <-- new: map pair -> base asset code for balances
+)
+from signal_engine import screen_and_build_candidates, make_maker_tickets
 
 getcontext().prec = 28
+WS_URL = "wss://ws-auth.kraken.com/v2"
 
-def _expand_env_vars(d):
-    if isinstance(d, dict):
-        return {k: _expand_env_vars(v) for k, v in d.items()}
-    if isinstance(d, list):
-        return [_expand_env_vars(x) for x in d]
-    if isinstance(d, str) and d.startswith("${") and d.endswith("}"):
-        return os.getenv(d[2:-1], "")
-    return d
 
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
-    return _expand_env_vars(cfg)
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-CFG = load_config()
 
-def kraken_symbol(symbol: str) -> str:
-    return f"{symbol.upper()}/USD"
+def _round(x: float, dp: int | None) -> float:
+    if dp is None:
+        return x
+    return float(Decimal(str(x)).quantize(Decimal("1." + ("0" * int(dp)))))
 
-def get_last_price(symbol_pair: str) -> Decimal:
-    from kraken_public_adapter import get_ticker_last
-    px = get_ticker_last(symbol_pair)
-    return Decimal(str(px))
 
-class TpManager:
-    def __init__(self):
-        self.targets: Dict[int, Dict] = {}
-    def register(self, userref: int, symbol: str, side: str, tp_price: Decimal, filled_base: Decimal):
-        self.targets[userref] = {"symbol": symbol, "side": side, "tp_price": tp_price, "filled_base": filled_base}
-    def update_fill(self, userref: int, add_base: Decimal):
-        if userref in self.targets:
-            self.targets[userref]["filled_base"] += add_base
-    def should_tp(self, userref: int, last: Decimal) -> bool:
-        t = self.targets.get(userref)
-        if not t: return False
-        return (last >= t["tp_price"]) if t["side"] == "buy" else (last <= t["tp_price"])
+@dataclass
+class State:
+    pair: str
+    side: str
+    qty_total: float
+    entry_px: float
+    tp_px: float
+    stop_trig: float
+    stop_limit: float
+    entry_id: Optional[str] = None
+    tp_id: Optional[str] = None
+    stop_child_id: Optional[str] = None
+    entry_filled: float = 0.0
+    tp_open_qty: float = 0.0
+    done: bool = False
+    userref: int = 0
 
-TPM = TpManager()
 
-def place_entry_with_bracket(
-    auth: KrakenAuth,
-    symbol_pair: str,
-    side: str,
-    qty: Decimal,
-    limit_px: Decimal,
-    tp_px: Decimal,
-    sl_trigger: Decimal,
-    userref: int,
-):
-    print(f"[info] TP target registered for userref={userref}: {symbol_pair} TP={tp_px} side={'sell' if side=='buy' else 'buy'} qty<=filled")
+class OCOController:
+    def __init__(self, auth: KrakenAuth, st: State):
+        self.auth = auth
+        self.ws_token = auth.get_ws_token()
+        self.state = st
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self._lock = threading.Lock()
+        self._base_asset = base_asset_for_pair(st.pair)  # e.g., 'XETH'/'ETHFI' style code
+        self._ordmin = ordermin_for_pair(st.pair)
 
-    # Try WS v2 first (requires WS token). If it fails (network), fall back to REST OTO.
-    try:
-        trader = WsV2Trader(auth)
-        trader.connect()  # robust TLS (certifi) inside; tries two sslopt modes
+    # ---------- helpers ----------
+    def _free_base_qty(self) -> float:
+        """How much base asset is free (not locked by other orders)."""
         try:
-            resp = trader.add_order_limit_with_stop(
-                symbol=symbol_pair,
-                side=side,
-                qty=qty,
-                limit_price=limit_px,
-                stop_trigger=sl_trigger,
-                stop_limit=None,
-                post_only=True,
-                userref=userref,
-                cl_ord_id=f"owcg-{userref}",  # OK on WS
-            )
-            print(f"[entry:ws] posted symbol={symbol_pair} side={side} qty={qty} px={limit_px} userref={userref}")
-        finally:
-            trader.close()
-    except Exception as e:
-        print(f"[warn] WS path unavailable ({e}); falling back to REST OTO.")
-        rest_pair = _pair_to_rest(symbol_pair)  # e.g., "FLOKI/USD" -> "FLOKIUSD"
-        resp = place_entry_with_stop_rest(
-            auth=auth,
-            symbol=rest_pair,
-            side=side,
-            qty=qty,
-            limit_price=limit_px,
-            stop_trigger=sl_trigger,
-            userref=userref,
-            post_only=True,
-            # no cl_ord_id on REST when userref is set
+            bals = get_balance(self.auth)  # {'XETH': '0.123', 'ZUSD': '45.0', ...}
+            raw = bals.get(self._base_asset, "0")
+            return float(raw)
+        except Exception:
+            return 0.0
+
+    # ---------- placement ----------
+    def place_entry_with_attached_stop(self):
+        s = self.state
+        post_only = "post" in (C.OFLAGS_ENTRY or "").lower()
+        s.entry_id = place_entry_with_stop_rest(
+            self.auth, s.pair, s.side, s.entry_px, s.qty_total, s.stop_trig, s.stop_limit, userref=s.userref, post_only=post_only
         )
-        print(f"[entry:rest] posted symbol={rest_pair} side={side} qty={qty} px={limit_px} userref={userref}")
+        print(f"[{_now()}] Entry placed: {s.entry_id}")
 
-    TPM.register(userref, symbol_pair, side, tp_px, Decimal("0"))
-
-def maybe_fire_tp_and_cancel_stops(auth: KrakenAuth, userref: int) -> bool:
-    t = TPM.targets.get(userref)
-    if not t:
-        return False
-    last = get_last_price(t["symbol"])
-    print(f"[status] userref={userref} last={last} tp_target={t['tp_price']} filled={t['filled_base']}")
-    if not TPM.should_tp(userref, last):
-        return False
-    qty = t["filled_base"].quantize(Decimal("0.00000001"))
-    if qty <= 0:
-        print(f"[warn] TP condition met but no filled qty yet for userref={userref}")
-        return False
-    side_exit = "sell" if t["side"] == "buy" else "buy"
-
-    if str(CFG["brackets"]["tp_exit"]).lower() == "market":
-        txid = place_market_exit(auth, t["symbol"], side_exit, qty)
-        print(f"[oco] TP MARKET placed: txid={txid} symbol={t['symbol']} side={side_exit} qty={qty}")
-    else:
-        txid = place_limit_exit(auth, t["symbol"], side_exit, qty, t["tp_price"])
-        print(f"[oco] TP LIMIT placed: txid={txid} symbol={t['symbol']} side={side_exit} qty={qty} price={t['tp_price']}")
-
-    # Cancel OTO stop children by userref (works for both WS and REST placements)
-    trader = WsV2Trader(auth)
-    try:
-        trader.connect()
-    except Exception:
-        # If WS still down, REST loop inside broker will still work
-        pass
-    try:
-        canceled = trader.cancel_oto_children_for_userref(userref)
-        print(f"[oco] canceled {len(canceled)} STOP children for userref={userref}")
-        TPM.targets.pop(userref, None)
-    finally:
+    def try_place_tp_now(self) -> bool:
+        s = self.state
         try:
-            trader.close()
+            if C.TP_EXIT_MODE == "limit":
+                # Immediate TP attempt (reduce_only). On Spot this is rejected; harmless.
+                s.tp_id = place_limit_order(
+                    self.auth,
+                    s.pair,
+                    "sell" if s.side == "buy" else "buy",
+                    s.tp_px,
+                    s.qty_total,
+                    post_only=True,
+                    reduce_only=True,
+                )
+                self.state.tp_open_qty = s.qty_total
+                print(f"[{_now()}] TP placed: {s.tp_id} (reduce_only=True)")
+                return True
+            return False
+        except Exception as e:
+            print(f"[{_now()}] TP immediate placement deferred: {e}")
+            return False
+
+    def place_or_resize_tp_to(self, desired_qty: float):
+        """Place/amend TP using ONLY free base and honoring ordermin."""
+        with self._lock:
+            s = self.state
+            if C.TP_EXIT_MODE != "limit":
+                return
+
+            free_base = self._free_base_qty()
+            # clamp to what we actually have free; defers if tiny
+            qty = float(max(0.0, min(desired_qty, free_base)))
+            if qty <= 0:
+                print(f"[{_now()}] TP deferred: free base={free_base:.8f}; waiting for fills to credit.")
+                return
+
+            if self._ordmin and qty < self._ordmin:
+                print(f"[{_now()}] TP deferred: free base {qty:.8f} < ordermin {self._ordmin}.")
+                return
+
+            if not s.tp_id:
+                try:
+                    s.tp_id = place_limit_order(
+                        self.auth,
+                        s.pair,
+                        "sell" if s.side == "buy" else "buy",
+                        s.tp_px,
+                        qty,
+                        post_only=True,
+                        reduce_only=False,  # we have base, so a normal sell is fine
+                    )
+                    s.tp_open_qty = qty
+                    print(f"[{_now()}] TP placed after fill: {s.tp_id} size={qty}")
+                except Exception as e:
+                    print(f"[{_now()}] Could not place TP yet (will retry): {e}")
+                return
+
+            # amend via WS v2 (keeps order id / queue when possible)
+            try:
+                msg = {
+                    "method": "amend_order",
+                    "params": {"order_id": s.tp_id, "order_qty": qty, "token": self.ws_token},
+                }
+                self.ws.send(json.dumps(msg))
+                s.tp_open_qty = qty
+                print(f"[{_now()}] TP amend requested -> qty={qty}")
+            except Exception as e:
+                print(f"[{_now()}] TP amend failed (will retry): {e}")
+
+    # ---------- WS lifecycle ----------
+    def run(self):
+        # Place entry + stop; try to place TP immediately
+        self.place_entry_with_attached_stop()
+        self.try_place_tp_now()
+
+        # Start WS v2 executions
+        def on_open(ws):
+            sub = {"method": "subscribe", "params": {"channel": "executions", "token": self.ws_token, "snap_orders": True}}
+            ws.send(json.dumps(sub))
+            print(f"[{_now()}] WS connected; subscribed to executions.")
+
+        def on_message(ws, message: str):
+            try:
+                payload = json.loads(message)
+            except Exception:
+                return
+            if isinstance(payload, dict) and payload.get("channel") == "executions":
+                for er in payload.get("data", []):
+                    self._handle_exec(er)
+
+        def on_error(ws, err):
+            print(f"[{_now()}] WS error: {err}")
+
+        def on_close(ws, *args):
+            print(f"[{_now()}] WS closed.")
+
+        self.ws = websocket.WebSocketApp(
+            WS_URL, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close
+        )
+        # portable TLS verification using certifi bundle
+        t = threading.Thread(
+            target=self.ws.run_forever,
+            kwargs={
+                "ping_interval": 20,
+                "ping_timeout": 10,
+                "sslopt": {
+                    "cert_reqs": ssl.CERT_REQUIRED,
+                    "ca_certs": certifi.where(),
+                },
+            },
+            daemon=True,
+        )
+        t.start()
+
+        while not self.state.done:
+            time.sleep(0.25)
+        try:
+            self.ws.close()
         except Exception:
             pass
-    return True
+
+    # ---------- Exec handler ----------
+    def _handle_exec(self, er: Dict):
+        s = self.state
+
+        # Learn stop child id when Kraken creates it
+        if er.get("ord_ref_id") == s.entry_id and er.get("order_type") in ("stop-loss", "stop-loss-limit"):
+            if not s.stop_child_id and er.get("order_id"):
+                s.stop_child_id = er["order_id"]
+                print(f"[{_now()}] Stop child created: {s.stop_child_id}")
+
+        # Entry updates
+        if er.get("order_id") == s.entry_id:
+            st = er.get("order_status")
+            if "cum_qty" in er:
+                s.entry_filled = float(er["cum_qty"])
+                # Try to place/amend TP to the *free base* (handles funds + ordermin)
+                self.place_or_resize_tp_to(s.entry_filled)
+
+            if st in ("filled", "canceled", "expired"):
+                if s.tp_id:
+                    try:
+                        cancel_order(self.auth, s.tp_id)
+                        print(f"[{_now()}] Entry closed -> canceled TP {s.tp_id}")
+                    except Exception as e:
+                        print(f"[{_now()}] Cancel TP failed after entry close: {e}")
+                s.done = True
+                return
+
+        # TP filled
+        if s.tp_id and er.get("order_id") == s.tp_id and er.get("order_status") == "filled":
+            try:
+                if s.stop_child_id:
+                    cancel_order(self.auth, s.stop_child_id)
+                    print(f"[{_now()}] TP filled -> canceled STOP child {s.stop_child_id}")
+                else:
+                    cancel_order(self.auth, s.entry_id)
+                    print(f"[{_now()}] TP filled -> canceled ENTRY to drop STOP")
+            except Exception as e:
+                print(f"[{_now()}] Cancel STOP after TP failed: {e}")
+            s.done = True
+            return
+
+        # STOP filled
+        if s.stop_child_id and er.get("order_id") == s.stop_child_id and er.get("order_status") == "filled":
+            if s.tp_id:
+                try:
+                    cancel_order(self.auth, s.tp_id)
+                    print(f"[{_now()}] STOP filled -> canceled TP {s.tp_id}")
+                except Exception as e:
+                    print(f"[{_now()}] Cancel TP after STOP failed: {e}")
+            s.done = True
+            return
+
 
 def main():
-    api_key, api_secret_b64 = get_kraken_credentials()
-    print(f"[env] KRAKEN_API_KEY len={len(api_key)}  KRAKEN_API_SECRET(_B64) len={len(api_secret_b64)}")
-
-    universe: List[str] = CFG["screen"]["universe"]
-    tickets = screen_and_build_candidates(universe, CFG)
-    if not tickets:
-        print("[run] no candidates")
+    print(f"[{_now()}] DRY_RUN={C.DRY_RUN}")
+    if C.DRY_RUN:
+        print("Dry-run enabled. Set live.dry_run: false (or DRY_RUN=0) to trade.")
         return
 
-    t0 = tickets[0]
-    sym = t0["symbol"]
-    pair = kraken_symbol(sym)
-    print(f"[run] candidate {sym} score={t0['score']:.3f} intent={t0['intent']}")
-
-    last = get_last_price(pair)
-    qty = (Decimal("50") / last).quantize(Decimal("0.00000001"))
-    side = "buy"
-    tp_off_bps = Decimal(str(CFG["brackets"]["tp_offset_bps"])) / Decimal(10000)
-    tp_px = (last * (Decimal("1.0") + tp_off_bps)).quantize(Decimal("0.00000001"))
-    sl_px = (last * (Decimal("1.0") - (tp_off_bps * Decimal("0.7")))).quantize(Decimal("0.00000001"))
-    userref = int(datetime.now(timezone.utc).timestamp() * 1000) % 2_147_483_647
-
-    if CFG["live"]["dry_run"]:
-        print(f"[dry-run] would place entry {side} {qty} @ {last} on {pair}")
-        print(f"[dry-run] TP target will be {tp_px} (exit side {'sell' if side=='buy' else 'buy'})")
-        print(f"[dry-run] SL trigger will be {sl_px}")
+    # screen → top ticket
+    cands = screen_and_build_candidates()
+    tickets = make_maker_tickets(cands)
+    if tickets.empty:
+        print("No candidates; exiting.")
         return
 
-    auth = KrakenAuth(api_key, api_secret_b64)
+    t = tickets.iloc[0]
+    pair = str(t["kraken_pair"])
+    side = str(t["side"])
+    entry = float(t["entry_price"])
+    qty = float(t["qty"])
+    tp = float(t["take_profit"])
+    stop_trig = float(t["stop"])
 
-    place_entry_with_bracket(
-        auth=auth,
-        symbol_pair=pair,
+    # rounding: min(pair_decimals, configured dp) if provided
+    pair_dp = pair_decimals(pair)
+    price_dp = pair_dp if C.PRICE_ROUND_DP is None else min(pair_dp, int(C.PRICE_ROUND_DP))
+    qty_dp = C.QTY_ROUND_DP if C.QTY_ROUND_DP is not None else 8
+
+    # compute stop limit beyond trigger
+    if side == "buy":
+        stop_limit = stop_trig * (1.0 - (C.STOP_LIMIT_OFFSET_BPS / 1e4))
+    else:
+        stop_limit = stop_trig * (1.0 + (C.STOP_LIMIT_OFFSET_BPS / 1e4))
+
+    entry = _round(entry, price_dp)
+    tp = _round(tp, price_dp)
+    stop_trig = _round(stop_trig, price_dp)
+    stop_limit = _round(stop_limit, price_dp)
+    qty = _round(qty, qty_dp)
+
+    print(f"[{_now()}] Candidate: {pair} {side} qty={qty} entry={entry} tp={tp} stop_trig={stop_trig} stop_lim={stop_limit}")
+
+    st = State(
+        pair=pair,
         side=side,
-        qty=qty,
-        limit_px=last,
-        tp_px=tp_px,
-        sl_trigger=sl_px,
-        userref=userref,
+        qty_total=qty,
+        entry_px=entry,
+        tp_px=tp,
+        stop_trig=stop_trig,
+        stop_limit=stop_limit,
+        userref=int(time.time()),
     )
+    OCOController(KrakenAuth(), st).run()
+    print(f"[{_now()}] Done.")
 
-    # Simulate full fill so TP logic can trigger when price crosses
-    TPM.update_fill(userref, qty)
-
-    for _ in range(120):
-        if maybe_fire_tp_and_cancel_stops(auth, userref):
-            print("[done] TP placed and STOPs canceled (synthetic OCO complete).")
-            break
-        sleep(1.0)
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,2 @@
-coin_id,symbol,kraken_pair,mid,spread_median_bps,rv_1d_pct,atr_5m,inefficiency_score
-floki,FLOKI,FLOKIUSD,0.00010303499999999999,8.734895909156506,3.611433212916811,1.4284641069677284e-07,-5.123462696239695
-aptos,APT,APTUSD,4.59455,4.135334254714853,3.9352809797249586,0.005143724099339307,-0.20005327498989445
+symbol,kraken_pair,side,entry_price,qty,take_profit,stop,maker_edge_bps,rv_bps,atr_pct,score,vol24h_usd,pnl_if_tp_usd,pnl_if_stop_usd
+ETH,ETHFIUSD,buy,1.0931,137.13658804,1.09441172,1.07943625,12.8,20.0,0.117,-3.6,122584.56,0.17952503565331854,-1.8700524547218682
