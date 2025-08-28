@@ -9,7 +9,7 @@ from decimal import Decimal, getcontext
 from typing import Optional, Dict
 
 import websocket  # websocket-client
-import ssl, certifi  # TLS root CA bundle
+import ssl, certifi  # TLS CA bundle
 
 import config as C
 from broker.kraken_private import (
@@ -17,13 +17,13 @@ from broker.kraken_private import (
     place_entry_with_stop_rest,
     place_limit_order,
     cancel_order,
-    get_balance,            # <-- new: read balances to compute free base
+    get_balance,  # read balances for free base
 )
 from kraken_public import (
     ticker_info,
     pair_decimals,
-    ordermin_for_pair,      # <-- new: enforce TP >= ordermin
-    base_asset_for_pair,    # <-- new: map pair -> base asset code for balances
+    ordermin_for_pair,
+    base_asset_for_pair,
 )
 from signal_engine import screen_and_build_candidates, make_maker_tickets
 
@@ -66,18 +66,37 @@ class OCOController:
         self.state = st
         self.ws: Optional[websocket.WebSocketApp] = None
         self._lock = threading.Lock()
-        self._base_asset = base_asset_for_pair(st.pair)  # e.g., 'XETH'/'ETHFI' style code
+        self._base_asset = base_asset_for_pair(st.pair)
         self._ordmin = ordermin_for_pair(st.pair)
+        self._first_fill_ts: Optional[float] = None  # for TP grace enforcement
 
     # ---------- helpers ----------
     def _free_base_qty(self) -> float:
         """How much base asset is free (not locked by other orders)."""
         try:
-            bals = get_balance(self.auth)  # {'XETH': '0.123', 'ZUSD': '45.0', ...}
+            bals = get_balance(self.auth)  # {'ZUSD': '123.45', 'XETH': '0.12', 'ETHFI': '9.5', ...}
             raw = bals.get(self._base_asset, "0")
             return float(raw)
         except Exception:
             return 0.0
+
+    def _enforce_tp_grace_if_needed(self):
+        """If we had a first fill but still have no TP after the grace window, cancel the entry."""
+        if not C.TP_GRACE_MS:
+            return
+        if self._first_fill_ts is None:
+            return
+        s = self.state
+        if s.tp_id:
+            return
+        if (time.time() - self._first_fill_ts) * 1000 >= C.TP_GRACE_MS:
+            try:
+                # Cancel entry; canceling parent drops the conditional close child as well.
+                cancel_order(self.auth, s.entry_id)
+                print(f"[{_now()}] TP grace exceeded ({C.TP_GRACE_MS} ms) → canceled ENTRY {s.entry_id}")
+            except Exception as e:
+                print(f"[{_now()}] Failed to cancel ENTRY after TP grace: {e}")
+            s.done = True
 
     # ---------- placement ----------
     def place_entry_with_attached_stop(self):
@@ -92,7 +111,6 @@ class OCOController:
         s = self.state
         try:
             if C.TP_EXIT_MODE == "limit":
-                # Immediate TP attempt (reduce_only). On Spot this is rejected; harmless.
                 s.tp_id = place_limit_order(
                     self.auth,
                     s.pair,
@@ -100,7 +118,7 @@ class OCOController:
                     s.tp_px,
                     s.qty_total,
                     post_only=True,
-                    reduce_only=True,
+                    reduce_only=True,  # rejected on Spot; harmless
                 )
                 self.state.tp_open_qty = s.qty_total
                 print(f"[{_now()}] TP placed: {s.tp_id} (reduce_only=True)")
@@ -110,23 +128,26 @@ class OCOController:
             print(f"[{_now()}] TP immediate placement deferred: {e}")
             return False
 
-    def place_or_resize_tp_to(self, desired_qty: float):
-        """Place/amend TP using ONLY free base and honoring ordermin."""
+    def place_or_resize_tp_to(self, desired_qty: float) -> bool:
+        """Place/amend TP using ONLY free base and honoring ordermin. Returns True if a TP is live."""
         with self._lock:
             s = self.state
             if C.TP_EXIT_MODE != "limit":
-                return
+                return False
 
             free_base = self._free_base_qty()
-            # clamp to what we actually have free; defers if tiny
             qty = float(max(0.0, min(desired_qty, free_base)))
+
+            if self._first_fill_ts is None and qty > 0:
+                self._first_fill_ts = time.time()
+
             if qty <= 0:
                 print(f"[{_now()}] TP deferred: free base={free_base:.8f}; waiting for fills to credit.")
-                return
+                return False
 
             if self._ordmin and qty < self._ordmin:
                 print(f"[{_now()}] TP deferred: free base {qty:.8f} < ordermin {self._ordmin}.")
-                return
+                return False
 
             if not s.tp_id:
                 try:
@@ -137,25 +158,24 @@ class OCOController:
                         s.tp_px,
                         qty,
                         post_only=True,
-                        reduce_only=False,  # we have base, so a normal sell is fine
+                        reduce_only=False,
                     )
                     s.tp_open_qty = qty
                     print(f"[{_now()}] TP placed after fill: {s.tp_id} size={qty}")
+                    return True
                 except Exception as e:
                     print(f"[{_now()}] Could not place TP yet (will retry): {e}")
-                return
+                    return False
 
-            # amend via WS v2 (keeps order id / queue when possible)
             try:
-                msg = {
-                    "method": "amend_order",
-                    "params": {"order_id": s.tp_id, "order_qty": qty, "token": self.ws_token},
-                }
+                msg = {"method": "amend_order", "params": {"order_id": s.tp_id, "order_qty": qty, "token": self.ws_token}}
                 self.ws.send(json.dumps(msg))
                 s.tp_open_qty = qty
                 print(f"[{_now()}] TP amend requested -> qty={qty}")
+                return True
             except Exception as e:
                 print(f"[{_now()}] TP amend failed (will retry): {e}")
+                return False
 
     # ---------- WS lifecycle ----------
     def run(self):
@@ -193,17 +213,17 @@ class OCOController:
             kwargs={
                 "ping_interval": 20,
                 "ping_timeout": 10,
-                "sslopt": {
-                    "cert_reqs": ssl.CERT_REQUIRED,
-                    "ca_certs": certifi.where(),
-                },
+                "sslopt": {"cert_reqs": ssl.CERT_REQUIRED, "ca_certs": certifi.where()},
             },
             daemon=True,
         )
         t.start()
 
+        # Cooperative loop: also enforces TP grace even if no further execs arrive
         while not self.state.done:
+            self._enforce_tp_grace_if_needed()
             time.sleep(0.25)
+
         try:
             self.ws.close()
         except Exception:
@@ -222,10 +242,16 @@ class OCOController:
         # Entry updates
         if er.get("order_id") == s.entry_id:
             st = er.get("order_status")
+
+            # Show live progress
             if "cum_qty" in er:
                 s.entry_filled = float(er["cum_qty"])
-                # Try to place/amend TP to the *free base* (handles funds + ordermin)
-                self.place_or_resize_tp_to(s.entry_filled)
+                fb = self._free_base_qty()
+                print(f"[{_now()}] Exec update: cum_qty={s.entry_filled:.8f}, free_base={fb:.8f}, ordmin={self._ordmin}")
+
+                tp_ok = self.place_or_resize_tp_to(s.entry_filled)
+                if not tp_ok:
+                    self._enforce_tp_grace_if_needed()
 
             if st in ("filled", "canceled", "expired"):
                 if s.tp_id:

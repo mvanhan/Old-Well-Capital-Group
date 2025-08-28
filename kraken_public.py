@@ -76,11 +76,10 @@ def ordermin_for_pair(pair: str) -> float:
 
 def base_asset_for_pair(pair: str) -> str:
     """
-    Returns Kraken's base asset code for a given altname pair (e.g., 'ETHFIUSD' -> 'ETHFI' or 'XETH' style).
-    Use this key to look up balances in /private/Balance.
+    Returns Kraken's base asset code for a given altname pair (e.g., 'ETHFIUSD' -> 'ETHFI' or 'XETH').
+    Use this code to look up balances in /private/Balance.
     """
     v = _find_pair_info_by_altname(pair)
     if not v:
         return ""
-    # Kraken returns something like 'base': 'XETH' (or just 'ETHFI' for some tokens)
     return str(v.get("base", "")).strip()
