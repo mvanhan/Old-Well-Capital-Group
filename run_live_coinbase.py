@@ -14,6 +14,9 @@ import csv
 from pathlib import Path
 from decimal import Decimal
 
+from dotenv import load_dotenv
+load_dotenv()  # ensure COINBASE_API_KEY / COINBASE_API_SECRET are loaded
+
 from broker.coinbase_public import CoinbasePublic
 from broker.coinbase_private import CoinbasePrivate
 
@@ -65,14 +68,13 @@ def read_first_ticket(path: Path) -> dict:
 
 def main():
     # --- API keys (CDP Advanced Trade SDK style) ---
-    # Expect:
     #   COINBASE_API_KEY    -> "organizations/{org_id}/apiKeys/{key_id}"
-    #   COINBASE_API_SECRET -> literal EC private key PEM string (-----BEGIN EC PRIVATE KEY----- ... )
+    #   COINBASE_API_SECRET -> full EC private key PEM block
     api_key = env_or_fail("COINBASE_API_KEY")
     api_secret = env_or_fail("COINBASE_API_SECRET")
 
     # --- Clients ---
-    pub = CoinbasePublic(api_key=None, api_secret=None)  # public endpoints OK without auth
+    pub = CoinbasePublic(api_key=api_key, api_secret=api_secret)  # auth also for market data calls
     prv = CoinbasePrivate(api_key=api_key, api_secret=api_secret)
 
     # --- Load ticket ---
@@ -89,7 +91,7 @@ def main():
     if not raw_entry or not raw_qty:
         raise SystemExit(f"Incomplete ticket row: {ticket}")
 
-    product_id = pub.map_pair_to_product_id(pair_like, CFG["quote_asset"])
+    product_id = pair_like  # already Coinbase format from strategy
     entry_price = Decimal(str(raw_entry))
     base_size = Decimal(str(raw_qty))
     tp_price = Decimal(str(raw_tp)) if raw_tp else None

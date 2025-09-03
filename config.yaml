@@ -13,12 +13,14 @@ brackets:
   tp_offset_bps: 30 # +0.30% above entry (30 bps)
   min_stop_pct: 0.5 # -0.50% below entry (floor)
   post_only: true # place entry as maker
+  # Optional tuning for strategy side (not used by live runner directly)
+  target_notional_usd: 25 # default per-trade notional for sizing in strategy
 
-# (Optional) Keep prior venues for reference/fallback; not used by run_live_coinbase.py
+# (Optional) Legacy venue notes for reference only
 binance:
   enabled: false
   notes: "Deprecated for NC; switched to Coinbase Advanced."
 
 kraken:
   enabled: false
-  notes: "Kept for historical reference."
+  notes: "Removed from strategy path; kept only as historical reference."

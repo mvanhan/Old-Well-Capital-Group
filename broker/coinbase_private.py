@@ -11,11 +11,14 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 
+def _to_dict(obj):
+    return obj.to_dict() if hasattr(obj, "to_dict") else obj
+
+
 class CoinbasePrivate:
     """
     Thin wrapper over the official SDK RESTClient for create/get orders.
-    We use the generic 'post' to send the full payload including
-    attached TP/SL (trigger_bracket_gtc).
+    We post the full payload including attached TP/SL (trigger_bracket_gtc).
     """
 
     def __init__(self, api_key: str, api_secret: str, timeout: int = 10):
@@ -34,10 +37,8 @@ class CoinbasePrivate:
     ) -> Dict[str, Any]:
         """
         Places a post-only LIMIT BUY with attached Take-Profit (limit) and Stop-Loss trigger,
-        using 'trigger_bracket_gtc' so that one cancels the other automatically.
-
+        using 'trigger_bracket_gtc' (OCO behavior).
         Endpoint: POST /api/v3/brokerage/orders
-        Docs: Attached TP/SL via 'attached_order_configuration.trigger_bracket_gtc'
         """
         if not client_order_id:
             client_order_id = f"owcg-{uuid.uuid4().hex[:16]}"
@@ -60,11 +61,9 @@ class CoinbasePrivate:
                 }
             },
         }
-        # Use SDK generic POST so we control the body precisely
         resp = self.client.post("/api/v3/brokerage/orders", data=payload)
-        # SDK returns a model; expose dict for consistency with rest of codebase
-        return resp.to_dict() if hasattr(resp, "to_dict") else resp
+        return _to_dict(resp)
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         o = self.client.get_order(order_id=order_id)
-        return o.to_dict() if hasattr(o, "to_dict") else o
+        return _to_dict(o)

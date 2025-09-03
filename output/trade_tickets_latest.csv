@@ -1,2 +1,2 @@
-symbol,kraken_pair,side,entry_price,qty,take_profit,stop,maker_edge_bps,rv_bps,atr_pct,score,vol24h_usd,pnl_if_tp_usd,pnl_if_stop_usd
-ETH,ETHFIUSD,buy,1.0931,137.13658804,1.09441172,1.07943625,12.8,20.0,0.117,-3.6,122584.56,0.17952503565331854,-1.8700524547218682
+symbol,entry_price,qty,take_profit,stop
+MOG-USD,8.6E-7,29069767,8.6E-7,8.5E-7
