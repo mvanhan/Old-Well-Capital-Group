@@ -1,75 +1,33 @@
-# =========================
-# OWCG – FULL CONFIG (drop-in)
-# =========================
+# config.yaml
 
-live:
-  dry_run: false # safety default
-  timezone: "UTC"
+# --- Choose which venue block to use (binance or binance_us). ---
+# The run_live_binance.py runner will read from `binance` if present, else `binance_us`.
+# You can also override any of these via env vars:
+#   BINANCE_API_BASE, BINANCE_RECV_WINDOW_MS, BINANCE_QUOTE_ASSET
 
-api:
-  kraken_key: "${KRAKEN_API_KEY}"
-  kraken_secret_b64: "${KRAKEN_API_SECRET_B64}" # base64-encoded raw secret (Kraken style)
-  coingecko_key: "${COINGECKO_API_KEY}"
+# Global Binance (default)
+binance:
+  api_base: "https://api.binance.com"
+  recv_window_ms: 5000
+  quote_asset: "USDT" # Common on global (e.g., BTCUSDT, APTUSDT)
 
-fees_bps:
-  maker: 0.0
-  taker: 20.0
+# United States (Binance.US). If you prefer USD pairs, flip the runner env or move this block under "binance".
+binance_us:
+  api_base: "https://api.binance.us"
+  recv_window_ms: 5000
+  quote_asset: "USD" # e.g., BTCUSD (availability depends on listing)
 
-risk:
-  nav_usd: 10000 # keep as-is (or your real NAV)
-  per_trade_pct: 0.0005 # 0.05% of NAV (5 bps) → very small risk driver
-  single_trade_cap_usd: 10
-  min_realized_risk_fraction: 0.15
-
-screen:
-  universe: ["BTC", "ETH", "SOL", "APT", "FLOKI"] # symbols (spot) to scan
-  min_vol_usd_24h: 50000
-
-alpha:
-  take: 1 # how many tickets to return
-  min_score: 0.0
-  normalize: zscore # zscore | minmax | none
-
-  weights:
-    maker_edge: 0.50
-    funding_crowding: 0.20
-    liquidity_fragility: 0.15
-    fragmentation: 0.10
-    legacy: 0.25
-
-  rv_window_minutes: 1440
-  atr_window_minutes: 1440
-  orderbook_levels: 5
-  our_order_usd: 50
-
-  fees_bps:
-    maker: 0.0
-    taker: 20.0
-
-  funding:
-    enable: true
-    fade_threshold_z: 1.0
-    carry_threshold_z: -1.0
-    lookback_hours: 24
-
-  fragmentation:
-    venues: ["kraken"] # extend later: coinbase, binance, etc.
-    min_cross_venue_spread_bps: 2.0
-
-overlays:
-  events_file: "events.yaml"
-  block_during_events: true
-  pre_event_minutes: 5
-  post_event_minutes: 10
-
+# Bracket behavior shared by the runner
 brackets:
-  use_ws_v2: true
-  tp_exit: "limit" # "limit" | "market"
-  tp_offset_bps: 12 # default TP distance if strategy doesn’t override
-  cancel_timeout_ms: 500
-  tp_grace_ms: 3000 # cancel entry if TP can’t be live within 3s after first fill (0 disables)
+  # If the trade ticket provides take_profit/stop, runner will use them.
+  # Otherwise it derives the following:
+  tp_offset_bps: 30 # +0.30% above entry (30 bps)
+  min_stop_pct: 0.5 # -0.50% below entry (floor)
+  stop_limit_offset_bps: 5 # SL limit is 5 bps below stop trigger
+  entry_fill_timeout_s: 60 # cancel entry if not filled within 60s
+  sleep_poll_s: 0.5 # polling cadence while waiting for fills
 
-execution:
-  oflags_entry: "post"
-  price_round_dp: 8
-  qty_round_dp: 8
+# (Optional) Keep Kraken blocks if you want a fallback path elsewhere in the repo
+kraken:
+  enabled: false
+  notes: "Kept for historical reference; new live path is run_live_binance.py"
