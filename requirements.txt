@@ -1,6 +1,9 @@
-pandas>=2.0
-requests>=2.31
-PyYAML>=6.0
-python-dotenv>=1.0
-websocket-client>=1.8
-certifi>=2024.2
+pandas
+requests
+PyYAML
+python-dotenv
+websocket-client
+certifi
+
+# Coinbase Advanced Trade SDK (handles JWT + auth)
+coinbase-advanced-py>=1.8.2

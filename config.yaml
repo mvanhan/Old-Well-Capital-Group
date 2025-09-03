@@ -1,33 +1,24 @@
 # config.yaml
 
-# --- Choose which venue block to use (binance or binance_us). ---
-# The run_live_binance.py runner will read from `binance` if present, else `binance_us`.
-# You can also override any of these via env vars:
-#   BINANCE_API_BASE, BINANCE_RECV_WINDOW_MS, BINANCE_QUOTE_ASSET
+# Coinbase Advanced Trade (default path for live trading)
+coinbase:
+  # Preferred quote asset for mapping tickets to product IDs (BTC-USD, ETH-USDC, etc.)
+  # You can override via env: COINBASE_QUOTE_ASSET
+  quote_asset: "USD"
 
-# Global Binance (default)
-binance:
-  api_base: "https://api.binance.com"
-  recv_window_ms: 5000
-  quote_asset: "USDT" # Common on global (e.g., BTCUSDT, APTUSDT)
-
-# United States (Binance.US). If you prefer USD pairs, flip the runner env or move this block under "binance".
-binance_us:
-  api_base: "https://api.binance.us"
-  recv_window_ms: 5000
-  quote_asset: "USD" # e.g., BTCUSD (availability depends on listing)
-
-# Bracket behavior shared by the runner
+# Bracket behavior shared by the Coinbase runner
 brackets:
-  # If the trade ticket provides take_profit/stop, runner will use them.
+  # If the trade ticket provides take_profit/stop, the runner will use them.
   # Otherwise it derives the following:
   tp_offset_bps: 30 # +0.30% above entry (30 bps)
   min_stop_pct: 0.5 # -0.50% below entry (floor)
-  stop_limit_offset_bps: 5 # SL limit is 5 bps below stop trigger
-  entry_fill_timeout_s: 60 # cancel entry if not filled within 60s
-  sleep_poll_s: 0.5 # polling cadence while waiting for fills
+  post_only: true # place entry as maker
 
-# (Optional) Keep Kraken blocks if you want a fallback path elsewhere in the repo
+# (Optional) Keep prior venues for reference/fallback; not used by run_live_coinbase.py
+binance:
+  enabled: false
+  notes: "Deprecated for NC; switched to Coinbase Advanced."
+
 kraken:
   enabled: false
-  notes: "Kept for historical reference; new live path is run_live_binance.py"
+  notes: "Kept for historical reference."
