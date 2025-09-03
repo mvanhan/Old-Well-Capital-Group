@@ -4,6 +4,8 @@ Live runner for Coinbase Advanced Trade:
   • Places a post-only LIMIT BUY and, in the SAME request, attaches a TP/SL bracket
     via 'attached_order_configuration.trigger_bracket_gtc' (OCO behavior).
   • Rounds all prices/sizes to product increments to avoid rejection.
+  • Ensures TP > entry and SL < entry by at least one tick.
+  • Logs inefficiency metrics (spread, tick, reward/risk in bps, RR, inefficiency_score).
 
 Reads the top candidate from output/trade_tickets_latest.csv with flexible columns:
   symbol | kraken_pair | pair, entry_price, qty | quantity, take_profit?, stop?
@@ -66,10 +68,16 @@ def read_first_ticket(path: Path) -> dict:
             raise SystemExit("trade_tickets_latest.csv is empty")
     return row
 
+def bps(x: Decimal) -> str:
+    return f"{x:.2f} bps"
+
+def fmt(x) -> str:
+    if isinstance(x, Decimal):
+        return f"{x.normalize()}"
+    return str(x)
+
 def main():
     # --- API keys (CDP Advanced Trade SDK style) ---
-    #   COINBASE_API_KEY    -> "organizations/{org_id}/apiKeys/{key_id}"
-    #   COINBASE_API_SECRET -> full EC private key PEM block
     api_key = env_or_fail("COINBASE_API_KEY")
     api_secret = env_or_fail("COINBASE_API_SECRET")
 
@@ -104,23 +112,57 @@ def main():
         sl_price = entry_price * (Decimal(1) - Decimal(CFG["min_stop_pct"]) / Decimal(100))
 
     # Rounding to product increments
-    entry_price_r = pub.round_price(product_id, entry_price)
-    base_size_r = pub.round_size(product_id, base_size)
-    tp_price_r = pub.round_price(product_id, tp_price)
-    sl_price_r = pub.round_price(product_id, sl_price)
+    entry_r = pub.round_price(product_id, entry_price)
+    size_r  = pub.round_size(product_id, base_size)
+    tp_r    = pub.round_price(product_id, tp_price)
+    sl_r    = pub.round_price(product_id, sl_price)
 
+    # --- Enforce Coinbase bracket bounds: TP > entry, SL < entry by at least one tick ---
+    tick = pub.quote_increment(product_id)
+    if tp_r <= entry_r:
+        tp_r = entry_r + tick
+    if sl_r >= entry_r:
+        sl_r = entry_r - tick
+    if sl_r <= 0:
+        sl_r = tick
+    tp_r = pub.round_price(product_id, tp_r)
+    sl_r = pub.round_price(product_id, sl_r)
+
+    # Market snapshot (for logging)
+    try:
+        bid, ask = pub.best_bid_ask(product_id)
+        mid = (bid + ask) / 2
+        spread = (ask - bid)
+        spread_bps = (spread / mid) * 10000 if mid > 0 else Decimal(0)
+        tick_bps = (tick / mid) * 10000 if mid > 0 else Decimal(0)
+    except Exception:
+        bid = ask = mid = spread = spread_bps = tick_bps = Decimal(0)
+
+    reward_bps = ((tp_r - entry_r) / entry_r) * 10000 if entry_r > 0 else Decimal(0)
+    risk_bps   = ((entry_r - sl_r) / entry_r) * 10000 if entry_r > 0 else Decimal(0)
+    rr_ratio   = (reward_bps / risk_bps) if risk_bps > 0 else Decimal(0)
+    denom      = spread_bps + (tick_bps / 2) if (spread_bps + tick_bps) > 0 else Decimal(1)
+    inefficiency_score = reward_bps / denom
+
+    # Logs
     print(f"[coinbase] product_id={product_id}")
-    print(f"[entry]  LIMIT_MAKER BUY base_size={base_size_r} price={entry_price_r} post_only={CFG['post_only']}")
-    print(f"[bracket] TP(limit)={tp_price_r}  SL(stop_trigger)={sl_price_r}")
+    if bid and ask:
+        print(f"[market]  bid={fmt(bid)}  ask={fmt(ask)}  spread={fmt(spread)} ({bps(spread_bps)})  tick={fmt(tick)} ({bps(tick_bps)})")
+    else:
+        print(f"[market]  (depth unavailable right now)")
+    print(f"[entry]   LIMIT_MAKER BUY base_size={fmt(size_r)} price={fmt(entry_r)} post_only={CFG['post_only']}")
+    print(f"[bracket] TP(limit)={fmt(tp_r)}  SL(stop_trigger)={fmt(sl_r)}")
+    print(f"[risk]    reward={bps(reward_bps)}  risk={bps(risk_bps)}  RR={rr_ratio:.2f}x")
+    print(f"[score]   inefficiency_score={inefficiency_score:.2f}  (reward_bps / (spread_bps + 0.5*tick_bps))")
 
     # --- Place parent with attached TP/SL (one API call) ---
     resp = prv.create_limit_buy_with_bracket(
         product_id=product_id,
-        base_size=str(base_size_r),
-        limit_price=str(entry_price_r),
+        base_size=str(size_r),
+        limit_price=str(entry_r),
         post_only=CFG["post_only"],
-        tp_limit_price=str(tp_price_r),
-        sl_stop_trigger_price=str(sl_price_r),
+        tp_limit_price=str(tp_r),
+        sl_stop_trigger_price=str(sl_r),
     )
 
     ok = resp.get("success", False)

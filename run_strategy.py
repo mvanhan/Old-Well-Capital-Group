@@ -1,23 +1,26 @@
 # run_strategy.py
 """
-Coinbase-native screener -> ticket writer with depth validation.
+Coinbase-native screener -> ticket writer with depth validation and detailed logs.
 
 Flow:
   1) Pull Coinbase public products (auth required on Advanced).
   2) Filter to products with the configured quote asset (coinbase.quote_asset, default USD).
   3) Sort candidates by 24h quote volume (desc) and pick the first that returns a live best bid/ask.
-     If none, fall back to a short majors list and again require live depth.
+     If none, fall back to a majors list and require live depth.
   4) Build a BUY ticket that:
-       • joins best bid as a post-only limit,
+       • joins best bid as a post-only limit (rounded to quote_increment),
        • sizes to ~target_notional_usd (rounded to base_increment),
-       • derives TP (+tp_offset_bps) & SL (-min_stop_pct) from config if not provided.
+       • derives TP (+tp_offset_bps) & SL (-min_stop_pct) and nudges them by one tick if needed
+         so that TP > entry and SL < entry.
   5) Write output/trade_tickets_latest.csv compatible with run_live_coinbase.py.
+  6) Print and save a rich log with an "inefficiency score" and all related data.
 """
 
 import os
 import csv
+import time
 from pathlib import Path
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 load_dotenv()  # ensure COINBASE_API_KEY / COINBASE_API_SECRET are loaded
@@ -27,6 +30,9 @@ from broker.coinbase_public import CoinbasePublic
 
 OUTDIR = Path("output")
 OUTDIR.mkdir(exist_ok=True)
+LOGDIR = Path("logs")
+LOGDIR.mkdir(exist_ok=True)
+
 TICKET_PATH = OUTDIR / "trade_tickets_latest.csv"
 
 # ---------- Load config ----------
@@ -44,6 +50,16 @@ def load_cfg():
             raw = yaml.safe_load(f) or {}
         cb = raw.get("coinbase") or {}
         br = raw.get("brackets") or {}
+        # Risk block (optional, if present keep target in sync)
+        risk = raw.get("risk") or {}
+        if "bankroll_usd" in risk and "max_trade_pct" in risk:
+            try:
+                bankroll = Decimal(str(risk["bankroll_usd"]))
+                max_pct = Decimal(str(risk["max_trade_pct"])) / Decimal(100)
+                cfg["target_notional_usd"] = float((bankroll * max_pct).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            except Exception:
+                pass
+
         cfg["quote_asset"] = cb.get("quote_asset", cfg["quote_asset"])
         cfg["tp_offset_bps"] = int(br.get("tp_offset_bps", cfg["tp_offset_bps"]))
         cfg["min_stop_pct"] = float(br.get("min_stop_pct", cfg["min_stop_pct"]))
@@ -83,7 +99,8 @@ def pick_product_with_depth(pub: CoinbasePublic, quote_asset: str):
         pid = p.get("product_id") or p.get("id")
         if not pid or not pid.endswith(f"-{quote_asset.upper()}"):
             continue
-        vol = Decimal(str(p.get("quote_volume_24h") or p.get("volume_24h") or "0"))
+        from decimal import Decimal as D
+        vol = D(str(p.get("quote_volume_24h") or p.get("volume_24h") or "0"))
         cands.append((pid, vol))
 
     if cands:
@@ -111,6 +128,22 @@ def write_ticket_row(row: dict):
         w.writeheader()
         w.writerow(row)
 
+def bps(x: Decimal) -> str:
+    return f"{x:.2f} bps"
+
+def fmt(x) -> str:
+    # Compact decimal -> string
+    if isinstance(x, Decimal):
+        return f"{x.normalize()}"
+    return str(x)
+
+def log_block(text: str):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = LOGDIR / f"strategy_{ts}.log"
+    with path.open("w") as f:
+        f.write(text)
+    print(text)
+
 def main():
     # Require keys because Advanced Trade market data needs Authorization
     api_key = env_or_fail("COINBASE_API_KEY")
@@ -121,36 +154,88 @@ def main():
     product_id, best_bid, best_ask = pick_product_with_depth(pub, CFG["quote_asset"])
 
     # Maker join on buy: place at best_bid (resting), post_only will guard us
-    entry_price = pub.round_price(product_id, best_bid)
+    entry = pub.round_price(product_id, best_bid)
+    tick = pub.quote_increment(product_id)
 
     # Size from target notional
     notional = Decimal(str(CFG["target_notional_usd"]))
-    if entry_price <= 0:
-        raise SystemExit(f"Invalid entry price for {product_id}: {entry_price}")
-    base_size = notional / entry_price
+    if entry <= 0:
+        raise SystemExit(f"Invalid entry price for {product_id}: {entry}")
+    base_size = notional / entry
     base_size_r = pub.round_size(product_id, base_size)
     if base_size_r <= 0:
-        # try bump to one increment
         base_size_r = pub.round_size(product_id, pub.base_increment(product_id))
 
-    # TP/SL
-    tp = entry_price * (Decimal(1) + Decimal(CFG["tp_offset_bps"]) / Decimal(10000))
-    sl = entry_price * (Decimal(1) - Decimal(CFG["min_stop_pct"]) / Decimal(100))
-    tp_r = pub.round_price(product_id, tp)
-    sl_r = pub.round_price(product_id, sl)
+    # TP/SL (derive + round + nudge by 1 tick if rounding collapsed them onto entry)
+    tp0 = entry * (Decimal(1) + Decimal(CFG["tp_offset_bps"]) / Decimal(10000))
+    sl0 = entry * (Decimal(1) - Decimal(CFG["min_stop_pct"]) / Decimal(100))
+    tp = pub.round_price(product_id, tp0)
+    sl = pub.round_price(product_id, sl0)
+    if tp <= entry:
+        tp = entry + tick
+    if sl >= entry:
+        sl = entry - tick
+    if sl <= 0:
+        sl = tick
+    tp = pub.round_price(product_id, tp)
+    sl = pub.round_price(product_id, sl)
 
+    # Metrics
+    mid = (best_bid + best_ask) / 2
+    spread = (best_ask - best_bid)
+    spread_bps = (spread / mid) * 10000 if mid > 0 else Decimal(0)
+    tick_bps = (tick / mid) * 10000 if mid > 0 else Decimal(0)
+
+    reward_bps = ((tp - entry) / entry) * 10000 if entry > 0 else Decimal(0)
+    risk_bps   = ((entry - sl) / entry) * 10000 if entry > 0 else Decimal(0)
+    rr_ratio   = (reward_bps / risk_bps) if risk_bps > 0 else Decimal(0)
+
+    # Inefficiency score: upside (reward_bps) compared to friction (spread + half-tick)
+    denom = spread_bps + (tick_bps / 2) if (spread_bps + tick_bps) > 0 else Decimal(1)
+    inefficiency_score = reward_bps / denom
+
+    # Write ticket
     row = {
-        "symbol": product_id,           # already Coinbase format; runner will accept it directly
-        "entry_price": str(entry_price),
+        "symbol": product_id,
+        "entry_price": str(entry),
         "qty": str(base_size_r),
-        "take_profit": str(tp_r),
-        "stop": str(sl_r),
+        "take_profit": str(tp),
+        "stop": str(sl),
     }
     write_ticket_row(row)
 
-    print("[strategy] Wrote ticket:")
+    # Rich log
+    lines = []
+    lines.append("=== STRATEGY TICKET ===")
+    lines.append(f"product_id: {product_id}")
+    lines.append(f"quote_asset: {CFG['quote_asset']}")
+    lines.append("")
+    lines.append("--- Market ---")
+    lines.append(f"best_bid: {fmt(best_bid)}")
+    lines.append(f"best_ask: {fmt(best_ask)}")
+    lines.append(f"mid:      {fmt(mid)}")
+    lines.append(f"spread:   {fmt(spread)}  ({bps(spread_bps)})")
+    lines.append(f"tick:     {fmt(tick)}     ({bps(tick_bps)})")
+    lines.append("")
+    lines.append("--- Order Plan ---")
+    lines.append(f"entry: {fmt(entry)}  size: {fmt(base_size_r)} (~${CFG['target_notional_usd']})  post_only: True")
+    lines.append(f"TP:    {fmt(tp)}")
+    lines.append(f"SL:    {fmt(sl)}")
+    lines.append("")
+    lines.append("--- Risk/Reward ---")
+    lines.append(f"reward_bps: {bps(reward_bps)}")
+    lines.append(f"risk_bps:   {bps(risk_bps)}")
+    lines.append(f"RR_ratio:   {rr_ratio:.2f}x")
+    lines.append("")
+    lines.append("--- Inefficiency ---")
+    lines.append(f"inefficiency_score: {inefficiency_score:.2f}  (reward_bps / (spread_bps + 0.5*tick_bps))")
+    lines.append("")
+    lines.append("--- CSV ---")
     for k, v in row.items():
-        print(f"  {k}: {v}")
+        lines.append(f"{k}: {v}")
+    lines.append("======================")
+
+    log_block("\n".join(lines))
 
 if __name__ == "__main__":
     main()

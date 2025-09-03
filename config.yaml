@@ -6,15 +6,20 @@ coinbase:
   # You can override via env: COINBASE_QUOTE_ASSET
   quote_asset: "USD"
 
-# Bracket behavior shared by the Coinbase runner
+# Risk settings (informational + to keep in sync with brackets.target_notional_usd)
+risk:
+  bankroll_usd: 100 # starting bankroll
+  max_trade_pct: 5 # cap per trade as % of bankroll (5% of $100 = $5)
+  notes: "run_strategy.py currently sizes with brackets.target_notional_usd; keep it aligned with bankroll * max_trade_pct."
+
+# Bracket behavior and sizing used by the runners/strategy
 brackets:
   # If the trade ticket provides take_profit/stop, the runner will use them.
   # Otherwise it derives the following:
   tp_offset_bps: 30 # +0.30% above entry (30 bps)
   min_stop_pct: 0.5 # -0.50% below entry (floor)
   post_only: true # place entry as maker
-  # Optional tuning for strategy side (not used by live runner directly)
-  target_notional_usd: 25 # default per-trade notional for sizing in strategy
+  target_notional_usd: 5 # derived from bankroll ($100) * max_trade_pct (5%) = $5
 
 # (Optional) Legacy venue notes for reference only
 binance:
