@@ -1,214 +1,157 @@
-# run_live_coinbase_stables.py
+#!/usr/bin/env python3
 """
-Live runner for the stables mean-reversion strategy (autonomous).
-- Scans the stable-pair universe, logs diagnostics, and if a candidate passes, places a
-  post-only LIMIT BUY with attached TP/SL bracket (OCO behavior) in ONE API call.
-- Does NOT rely on a pre-written ticket or any CSV artifacts.
+Stable-pair mean-reversion live submitter (Coinbase Advanced)
 
-Logs:
-- Writes a timestamped log to logs/stables_live_*.log with the best candidate details
-  and a summary table of the top candidates by inefficiency.
+- Reads output_stables/trade_tickets_latest.csv
+- Validates product increments and sizes
+- Submits a post-only LIMIT entry with an attached trigger_bracket_gtc (TP limit + SL trigger)
+- Ensures TP>entry and SL<entry (long) after rounding / nudging
+- Uses idempotent client_order_id
+
+This runner assumes your private client exposes ONE of these call surfaces:
+
+1) broker.coinbase_private.trigger_bracket_limit_maker(
+       product_id, side, base_size, entry_price, tp_limit_price, stop_trigger_price, client_order_id
+   ) -> dict
+
+2) broker.coinbase_private.add_order_limit_with_bracket(
+       product_id=..., side=..., base_size=..., limit_price=..., tp_limit_price=..., stop_trigger_price=..., post_only=True, client_order_id=...
+   ) -> dict
+
+If your method name differs, add a small adapter below.
 """
 
-import os
+from __future__ import annotations
+import csv
+import sys
 import time
-from pathlib import Path
+import uuid
 from decimal import Decimal
+from pathlib import Path
+from typing import Tuple
 
-from dotenv import load_dotenv
-load_dotenv()
+from utils.precision import q, round_price, round_size
+from risk.healthchecks import ok_to_trade_now
+from broker import coinbase_public as cb_pub
 
-import yaml
+# Try to import a placement function from your private client
+try:
+    from broker.coinbase_private import trigger_bracket_limit_maker as _submit_bracket
+except Exception:
+    _submit_bracket = None
+if _submit_bracket is None:
+    try:
+        from broker.coinbase_private import add_order_limit_with_bracket as _submit_bracket  # type: ignore
+    except Exception:
+        _submit_bracket = None
 
-from broker.coinbase_public import CoinbasePublic
-from broker.coinbase_private import CoinbasePrivate
-from strategies.stables_mean_reversion import StableParams, build_signal
+TICKET = Path("output_stables/trade_tickets_latest.csv")
 
-LOGDIR = Path("logs")
-LOGDIR.mkdir(exist_ok=True)
 
-# ---------- Helpers ----------
-def env_or_fail(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise SystemExit(f"Missing required env var: {name}")
-    return v
+def _load_ticket() -> dict:
+    if not TICKET.exists():
+        raise FileNotFoundError(f"No ticket found at {TICKET}")
+    with TICKET.open() as f:
+        r = list(csv.DictReader(f))
+    if not r:
+        raise RuntimeError("Ticket CSV is empty")
+    return r[0]
 
-def fmt(x) -> str:
-    return f"{x.normalize()}" if isinstance(x, Decimal) else str(x)
 
-def bps(x: Decimal) -> str:
-    return f"{x:.2f} bps"
+def _product_specs(product_id: str) -> Tuple[Decimal, Decimal, Decimal]:
+    """
+    Return (base_increment, quote_increment, min_size)
+    """
+    prods = cb_pub.get_products()
+    for p in prods:
+        if p["product_id"] == product_id:
+            base_inc = q(p.get("base_increment", "0.00000001"))
+            quote_inc = q(p.get("quote_increment", "0.00000001"))
+            min_size = q(p.get("min_order_size", p.get("base_min_size", "0.0")) or "0.0")
+            return base_inc, quote_inc, min_size
+    raise KeyError(f"Unknown product_id: {product_id}")
 
-# ---------- Load params (strict by default) ----------
-def load_params() -> StableParams:
-    p = StableParams()
-    # Defaults for live: keep strict; no auto-relax unless you enable it in config.
-    p.auto_relax = False
 
-    cfg_file = Path("config.yaml")
-    if cfg_file.exists():
-        with cfg_file.open("r") as f:
-            raw = yaml.safe_load(f) or {}
+def _validate_and_nudge(product_id: str, side: str, entry: Decimal, tp: Decimal, sl: Decimal, size: Decimal):
+    base_inc, quote_inc, min_size = _product_specs(product_id)
 
-        cb = raw.get("coinbase") or {}
-        if cb.get("quote_asset"):
-            p.quote_asset = cb["quote_asset"]
+    # Rounding + nudges
+    entry = round_price(entry, quote_inc, "down" if side == "BUY" else "up")
+    tp    = round_price(tp, quote_inc, "up" if side == "BUY" else "down")
+    sl    = round_price(sl, quote_inc, "down" if side == "BUY" else "up")
+    size  = round_size(size, base_inc, "down")
 
-        st = raw.get("stables") or {}
-        # All optional; safe if absent
-        p.granularity     = st.get("granularity", p.granularity)
-        p.alt_granularity = st.get("alt_granularity", p.alt_granularity)
-        p.lookback        = int(st.get("lookback", p.lookback))
-        p.roll_window     = int(st.get("roll_window", p.roll_window))
-        p.z_entry         = float(st.get("z_entry", p.z_entry))
-        p.z_stop          = float(st.get("z_stop", p.z_stop))
-        p.rr_min          = float(st.get("rr_min", p.rr_min))
-        p.hl_min          = float(st.get("hl_min", p.hl_min))
-        p.min_std_ticks   = int(st.get("min_std_ticks", p.min_std_ticks))
-        p.max_spread_bps  = float(st.get("max_spread_bps", p.max_spread_bps))
-        # Only enable auto relax if explicitly asked in config
-        if "auto_relax" in st:
-            p.auto_relax   = bool(st.get("auto_relax"))
+    # Ensure inequalities post rounding
+    if side == "BUY":
+        if tp <= entry:
+            tp = round_price(entry + quote_inc, quote_inc, "up")
+        if sl >= entry:
+            sl = round_price(entry - quote_inc, quote_inc, "down")
+    else:
+        if tp >= entry:
+            tp = round_price(entry - quote_inc, quote_inc, "down")
+        if sl <= entry:
+            sl = round_price(entry + quote_inc, quote_inc, "up")
 
-        # Risk → derive target_notional_usd if provided
-        risk = raw.get("risk") or {}
-        bankroll = risk.get("bankroll_usd")
-        max_pct = risk.get("max_trade_pct")
-        if bankroll is not None and max_pct is not None:
-            from decimal import ROUND_HALF_UP
-            tn = Decimal(str(bankroll)) * (Decimal(str(max_pct)) / Decimal(100))
-            p.target_notional_usd = float(tn.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        else:
-            br = raw.get("brackets") or {}
-            if br.get("target_notional_usd") is not None:
-                p.target_notional_usd = float(br["target_notional_usd"])
+    # Min size
+    if min_size > 0 and size < min_size:
+        size = round_size(min_size, base_inc, "up")
 
-    # env override for quote if present
-    p.quote_asset = os.environ.get("COINBASE_QUOTE_ASSET", p.quote_asset)
-    return p
+    return entry, tp, sl, size
 
-def main():
-    api_key = env_or_fail("COINBASE_API_KEY")
-    api_secret = env_or_fail("COINBASE_API_SECRET")
 
-    params = load_params()
-    pub = CoinbasePublic(api_key=api_key, api_secret=api_secret)
-    prv = CoinbasePrivate(api_key=api_key, api_secret=api_secret)
+def main() -> None:
+    if _submit_bracket is None:
+        print("[stables-live] ERROR: No placement function found in broker.coinbase_private.", file=sys.stderr)
+        sys.exit(2)
 
-    # Build signal & diagnostics (no CSV; just logs)
-    best, rows = build_signal(api_key, api_secret, params, pub)
+    if not ok_to_trade_now():
+        print("[stables-live] Trading paused by health checks")
+        sys.exit(0)
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    logp = LOGDIR / f"stables_live_{ts}.log"
-    with logp.open("w") as log:
-        def L(s): 
-            print(s); log.write(s + "\n")
+    t = _load_ticket()
+    product_id = t["product_id"]
+    side = t["side"].upper()
+    entry = q(t["entry_price"])
+    tp = q(t["tp_price"])
+    sl = q(t["stop_trigger"])
+    size = q(t["base_size"])
+    hold_minutes = int(t.get("hold_minutes", "180"))
 
-        L("=== STABLES MEAN-REVERSION LIVE SCAN ===")
-        L(f"quote_asset: {params.quote_asset}")
-        L(f"granularity={params.granularity} roll_window={params.roll_window} "
-          f"z_entry={params.z_entry} rr_min={params.rr_min} hl_min={params.hl_min} "
-          f"min_std_ticks={params.min_std_ticks} max_spread_bps={params.max_spread_bps} "
-          f"auto_relax={params.auto_relax}")
-        L(f"target_notional_usd={params.target_notional_usd}")
-        L("")
+    # Pre-flight validate increments / size and nudge if needed
+    entry, tp, sl, size = _validate_and_nudge(product_id, side, entry, tp, sl, size)
 
-        if not rows:
-            L("[stables-live] No usable pairs/candles/depth were found right now. Nothing placed.")
-            L(f"[stables-live] Log saved: {logp}")
-            return
+    # Confirm current bid/ask still compatible (avoid chasing)
+    bid, ask = cb_pub.get_best_bid_ask(product_id)
+    if side == "BUY" and entry > bid:
+        print(f"[stables-live] Entry {entry} > best bid {bid}; will rest and wait (post-only).")
+    if side == "SELL" and entry < ask:
+        print(f"[stables-live] Entry {entry} < best ask {ask}; will rest and wait (post-only).")
 
-        # Sort diagnostics by inefficiency (desc) and show top 10
-        rows_sorted = sorted(rows, key=lambda r: r["ineff"], reverse=True)
-        show = rows_sorted[:10]
-        L("--- Top candidates (by inefficiency) ---")
-        header = f"{'product':12s} {'z':>8s} {'hl_m':>6s} {'spread_bps':>11s} {'std_ticks':>10s} {'RR':>7s} {'ineff':>9s}"
-        L(header)
-        for r in show:
-            std_ticks = (r["std"] / r["tick"]) if r["tick"] > 0 else Decimal(0)
-            L(f"{r['product_id']:12s} {fmt(r['z']):>8s} "
-              f"{(f'{r['hl']:.2f}' if r['hl'] is not None else ''):>6s} "
-              f"{float(r['spread_bps']):11.3f} {float(std_ticks):10.2f} "
-              f"{float(r['rr']):7.2f} {float(r['ineff']):9.2f}")
-        L("")
+    client_order_id = f"stables-{product_id}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
-        if not best:
-            L("[stables-live] No candidate passed strict filters. Nothing placed.")
-            L(f"[stables-live] Log saved: {logp}")
-            return
+    print("[stables-live] Submitting:",
+          dict(product_id=product_id, side=side, base_size=str(size),
+               entry_price=str(entry), tp_price=str(tp), stop_trigger=str(sl),
+               client_order_id=client_order_id))
 
-        # ----- Place order for best candidate -----
-        pid = best["product_id"]
-        entry = best["entry"]
-        tp = best["tp"]
-        sl = best["sl"]
-
-        # Re-round & enforce TP>entry, SL<entry by at least one tick
-        entry_r = pub.round_price(pid, entry)
-        size = Decimal(str(params.target_notional_usd)) / entry_r if entry_r > 0 else Decimal(0)
-        size_r = pub.round_size(pid, size)
-        if size_r <= 0:
-            size_r = pub.round_size(pid, pub.base_increment(pid))
-        tp_r = pub.round_price(pid, tp)
-        sl_r = pub.round_price(pid, sl)
-        tick = pub.quote_increment(pid)
-        if tp_r <= entry_r:
-            tp_r = pub.round_price(pid, entry_r + tick)
-        if sl_r >= entry_r:
-            sl_r = pub.round_price(pid, entry_r - tick)
-        if sl_r <= 0:
-            sl_r = pub.round_price(pid, tick)
-
-        # Market snapshot for logs
-        try:
-            bid, ask = pub.best_bid_ask(pid)
-            mid = (bid + ask) / 2
-            spread = (ask - bid)
-            spread_bps = (spread / mid) * 10000 if mid > 0 else Decimal(0)
-            tick_bps = (tick / mid) * 10000 if mid > 0 else Decimal(0)
-        except Exception:
-            bid = ask = mid = spread = spread_bps = tick_bps = Decimal(0)
-
-        reward_bps = ((tp_r - entry_r) / entry_r) * 10000 if entry_r > 0 else Decimal(0)
-        risk_bps   = ((entry_r - sl_r) / entry_r) * 10000 if entry_r > 0 else Decimal(0)
-        rr_ratio   = (reward_bps / risk_bps) if risk_bps > 0 else Decimal(0)
-        denom      = spread_bps + (tick_bps / 2) if (spread_bps + tick_bps) > 0 else Decimal(1)
-        ineff      = reward_bps / denom
-
-        L("--- Selected candidate ---")
-        L(f"product_id: {pid}")
-        L(f"bid={fmt(best['bid'])} ask={fmt(best['ask'])} "
-          f"spread={fmt(best['spread'])} ({bps(best['spread_bps'])}) tick={fmt(best['tick'])}")
-        L(f"mean={fmt(best['mean'])} std={fmt(best['std'])} z={fmt(best['z'])} hl_min={best['hl']:.2f}")
-        L("")
-        L("--- Order Plan ---")
-        L(f"entry={fmt(entry_r)} size={fmt(size_r)} (~${params.target_notional_usd}) post_only=True")
-        L(f"TP={fmt(tp_r)}  SL={fmt(sl_r)}")
-        L("")
-        L("--- Risk/Reward ---")
-        L(f"reward={bps(reward_bps)}  risk={bps(risk_bps)}  RR={float(rr_ratio):.2f}x   ineff={float(ineff):.2f}")
-        L("")
-
-        # Place parent + attached bracket
-        resp = prv.create_limit_buy_with_bracket(
-            product_id=pid,
-            base_size=str(size_r),
-            limit_price=str(entry_r),
+    try:
+        resp = _submit_bracket(
+            product_id=product_id,
+            side=side,
+            base_size=str(size),
+            limit_price=str(entry),
+            tp_limit_price=str(tp),
+            stop_trigger_price=str(sl),
             post_only=True,
-            tp_limit_price=str(tp_r),
-            sl_stop_trigger_price=str(sl_r),
+            client_order_id=client_order_id,
         )
-        ok = resp.get("success", False)
-        if not ok:
-            L(f"[stables-live] Create order failed: {resp}")
-            L(f"[stables-live] Log saved: {logp}")
-            raise SystemExit(1)
+        print("[stables-live] Order response:", resp)
+        print(f"[stables-live] Hold budget: {hold_minutes} minutes (runner/ops should manage time-out exits).")
+    except Exception as e:
+        print("[stables-live] ERROR placing order:", repr(e), file=sys.stderr)
+        sys.exit(2)
 
-        sr = resp.get("success_response", {}) or {}
-        order_id = sr.get("order_id") or "<unknown>"
-        L(f"[ok] order_id={order_id} product_id={pid}")
-        L(f"[stables-live] Log saved: {logp}")
 
 if __name__ == "__main__":
     main()

@@ -1,132 +1,266 @@
-# run_strategy_stables.py
+#!/usr/bin/env python3
 """
-Offline/preview scanner for the stables mean-reversion strategy (logs only).
-- Scans the universe, logs a diagnostics table + best candidate (if any), and writes
-  a timestamped log to logs/stables_scan_*.log.
-- Does NOT write any CSVs.
-- Does NOT need to be run before live; live runner can scan and trade on its own.
+Stable-pair mean-reversion screener (Coinbase Advanced)
+
+- Discovers the stable-pair universe programmatically (fx_stablecoin==True)
+- Computes deviation from $1.0000 (USD-quoted) or from parity on stable-stable crosses
+- Selects the best candidate that clears cost gates and risk filters
+- Writes:
+    output_stables/screen_latest.csv
+    output_stables/trade_tickets_latest.csv   # consumed by run_live_coinbase_stables.py
+
+Key fixes vs prior version:
+- Guarantees TP > entry and SL < entry after rounding (tick nudge)
+- Uses post-only assumptions; requires |Δ| >= entry_bps + safety_margin
+- Pre-flights product increments and min sizes before ticket creation
+- No Kraken imports; Coinbase-only code path
+
+NOTE: This is a *scanner*. It does NOT place orders.
 """
 
+from __future__ import annotations
+import csv
 import os
 import time
-from pathlib import Path
+from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-from dotenv import load_dotenv
-load_dotenv()
+# --- Local modules (new small helpers) ---
+from utils.precision import q, round_price, round_size
+from risk.healthchecks import ok_to_trade_now
 
-import yaml
+# ---- Your existing public broker expected surface ----
+# Must provide:
+#   - get_products(): List[dict] each with product_id, base_increment, quote_increment, min_order_size, fx_stablecoin (bool), base_name, quote_name
+#   - get_best_bid_ask(product_id) -> Tuple[Decimal, Decimal]
+from broker import coinbase_public as cb_pub
 
-from broker.coinbase_public import CoinbasePublic
-from strategies.stables_mean_reversion import StableParams, build_signal
+OUTPUT_DIR = Path("output_stables")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-LOGDIR = Path("logs")
-LOGDIR.mkdir(exist_ok=True)
+# ---- Strategy params (tweak here or move to config.stables.yaml) ----
+ENTRY_BPS = q("10")         # enter when discount <= -10 bps (or ratio deviation ≥ +10 bps for the short leg)
+EXIT_BPS  = q("2")          # target exit near parity (+2 bps room to be lifted)
+SAFETY_BPS = q("5")         # extra buffer above cost floor
+KILL_BPS  = q("100")        # flatten if deviation widens beyond -100 bps (true stress)
+HOLD_MINUTES = 180          # time budget; runner will enforce
+TARGET_NOTIONAL_USD = q("25")  # small tickets while validating live behavior
 
-def env_or_fail(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise SystemExit(f"Missing required env var: {name}")
-    return v
+# Costs/guards for gate calculation
+TAKER_BPS = q("0")          # assume 0 if you truly avoid taker; scanner still adds safety buffer
+SLIPPAGE_BPS = q("1")       # conservative one-tick-ish cushion
 
-def fmt(x) -> str:
-    return f"{x.normalize()}" if isinstance(x, Decimal) else str(x)
+# Universe filters
+ALLOW_STABLE_STABLE = True  # allow USDC/DAI etc if listed as a product
+USD_LIKE = {"USD"}          # treat USD/USDC books as absolute-par targets
 
-def load_params() -> StableParams:
-    p = StableParams()
-    # Keep defaults for preview; allow auto_relax here if desired
-    cfg_file = Path("config.yaml")
-    if cfg_file.exists():
-        with cfg_file.open("r") as f:
-            raw = yaml.safe_load(f) or {}
 
-        cb = raw.get("coinbase") or {}
-        if cb.get("quote_asset"):
-            p.quote_asset = cb["quote_asset"]
+@dataclass
+class ProductSpec:
+    product_id: str
+    base: str
+    quote: str
+    base_inc: Decimal
+    quote_inc: Decimal
+    min_size: Decimal
+    fx_stablecoin: bool
 
-        st = raw.get("stables") or {}
-        p.granularity     = st.get("granularity", p.granularity)
-        p.alt_granularity = st.get("alt_granularity", p.alt_granularity)
-        p.lookback        = int(st.get("lookback", p.lookback))
-        p.roll_window     = int(st.get("roll_window", p.roll_window))
-        p.z_entry         = float(st.get("z_entry", p.z_entry))
-        p.z_stop          = float(st.get("z_stop", p.z_stop))
-        p.rr_min          = float(st.get("rr_min", p.rr_min))
-        p.hl_min          = float(st.get("hl_min", p.hl_min))
-        p.min_std_ticks   = int(st.get("min_std_ticks", p.min_std_ticks))
-        p.max_spread_bps  = float(st.get("max_spread_bps", p.max_spread_bps))
-        if "auto_relax" in st:
-            p.auto_relax   = bool(st["auto_relax"])
 
-        # Risk sizing optional; shown in logs only
-        risk = raw.get("risk") or {}
-        bankroll = risk.get("bankroll_usd")
-        max_pct = risk.get("max_trade_pct")
-        if bankroll is not None and max_pct is not None:
-            from decimal import ROUND_HALF_UP
-            tn = Decimal(str(bankroll)) * (Decimal(str(max_pct)) / Decimal(100))
-            p.target_notional_usd = float(tn.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        else:
-            br = raw.get("brackets") or {}
-            if br.get("target_notional_usd") is not None:
-                p.target_notional_usd = float(br["target_notional_usd"])
-    p.quote_asset = os.environ.get("COINBASE_QUOTE_ASSET", p.quote_asset)
-    return p
+@dataclass
+class Candidate:
+    product_id: str
+    side: str  # "BUY" or "SELL"
+    entry_price: Decimal
+    tp_price: Decimal
+    sl_trigger: Decimal
+    base_size: Decimal
+    deviation_bps: Decimal
+    rr: Decimal
 
-def main():
-    api_key = env_or_fail("COINBASE_API_KEY")
-    api_secret = env_or_fail("COINBASE_API_SECRET")
 
-    params = load_params()
-    pub = CoinbasePublic(api_key=api_key, api_secret=api_secret)
+def _list_stable_products() -> List[ProductSpec]:
+    specs = []
+    for p in cb_pub.get_products():
+        if not p.get("fx_stablecoin"):
+            continue
+        product_id = p["product_id"]
+        base = p.get("base_name") or p.get("base_currency") or product_id.split("-")[0]
+        quote = p.get("quote_name") or p.get("quote_currency") or product_id.split("-")[1]
+        base_inc = q(p.get("base_increment", "0.00000001"))
+        quote_inc = q(p.get("quote_increment", "0.00000001"))
+        min_size = q(p.get("min_order_size", p.get("base_min_size", "0.0")) or "0.0")
+        specs.append(ProductSpec(product_id, base, quote, base_inc, quote_inc, min_size, True))
+    return specs
 
-    best, rows = build_signal(api_key, api_secret, params, pub)
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    logp = LOGDIR / f"stables_scan_{ts}.log"
-    with logp.open("w") as log:
-        def L(s): 
-            print(s); log.write(s + "\n")
+def _deviation_bps(product: ProductSpec, bid: Decimal, ask: Decimal) -> Decimal:
+    """
+    For USD-quoted: deviation from $1 mid in bps (mid-1)*1e4
+    For stable-stable crosses: deviation from parity (mid - parity)*1e4, parity≈1
+    """
+    mid = (bid + ask) / 2
+    if product.quote in USD_LIKE and product.base.upper() in {"USDC","DAI","USDT","PYUSD","USDP"}:
+        return (mid - q("1")) * q("10000")
+    # generic parity target for stable-stable (ratio)
+    return (mid - q("1")) * q("10000")
 
-        L("=== STABLES MEAN-REVERSION SCAN (preview) ===")
-        L(f"quote_asset: {params.quote_asset}")
-        L(f"granularity={params.granularity} roll_window={params.roll_window} "
-          f"z_entry={params.z_entry} rr_min={params.rr_min} hl_min={params.hl_min} "
-          f"min_std_ticks={params.min_std_ticks} max_spread_bps={params.max_spread_bps} "
-          f"auto_relax={params.auto_relax}")
-        L(f"target_notional_usd={params.target_notional_usd}")
-        L("")
 
-        if not rows:
-            L("[stables-scan] No usable pairs/candles/depth were found right now.")
-            L(f"[stables-scan] Log saved: {logp}")
-            return
+def _price_targets(product: ProductSpec, side: str, bid: Decimal, ask: Decimal) -> Tuple[Decimal, Decimal]:
+    """
+    Compute candidate entry price (maker), TP near parity, and SL trigger at KILL_BPS.
+    Enforce tick rounding + one-tick nudge to guarantee TP>entry (long) or TP<entry (short).
+    """
+    # Entry target at best bid (BUY) or best ask (SELL), then nudge *inside* as maker
+    if side == "BUY":
+        raw_entry = min(bid, q("1") - ENTRY_BPS / q("10000"))
+        entry = round_price(raw_entry, product.quote_inc, mode="down")
+        # TP near 1.0000 + EXIT_BPS (resting ask)
+        raw_tp = q("1") + EXIT_BPS / q("10000")
+        tp = round_price(raw_tp, product.quote_inc, mode="up")
+        if tp <= entry:
+            tp = round_price(entry + product.quote_inc, product.quote_inc, mode="up")
+        # SL trigger at 1.0000 - KILL_BPS
+        raw_sl = q("1") - KILL_BPS / q("10000")
+        sl = round_price(raw_sl, product.quote_inc, mode="down")
+        if sl >= entry:
+            sl = round_price(entry - product.quote_inc, product.quote_inc, mode="down")
+        return entry, tp, sl
+    else:
+        raw_entry = max(ask, q("1") + ENTRY_BPS / q("10000"))
+        entry = round_price(raw_entry, product.quote_inc, mode="up")
+        raw_tp = q("1") - EXIT_BPS / q("10000")
+        tp = round_price(raw_tp, product.quote_inc, mode="down")
+        if tp >= entry:
+            tp = round_price(entry - product.quote_inc, product.quote_inc, mode="down")
+        raw_sl = q("1") + KILL_BPS / q("10000")
+        sl = round_price(raw_sl, product.quote_inc, mode="up")
+        if sl <= entry:
+            sl = round_price(entry + product.quote_inc, product.quote_inc, mode="up")
+        return entry, tp, sl
 
-        rows_sorted = sorted(rows, key=lambda r: r["ineff"], reverse=True)
-        show = rows_sorted[:10]
-        L("--- Top candidates (by inefficiency) ---")
-        header = f"{'product':12s} {'z':>8s} {'hl_m':>6s} {'spread_bps':>11s} {'std_ticks':>10s} {'RR':>7s} {'ineff':>9s}"
-        L(header)
-        for r in show:
-            from decimal import Decimal as D
-            std_ticks = (r["std"] / r["tick"]) if r["tick"] > 0 else D(0)
-            L(f"{r['product_id']:12s} {fmt(r['z']):>8s} "
-              f"{(f'{r['hl']:.2f}' if r['hl'] is not None else ''):>6s} "
-              f"{float(r['spread_bps']):11.3f} {float(std_ticks):10.2f} "
-              f"{float(r['rr']):7.2f} {float(r['ineff']):9.2f}")
-        L("")
 
-        if not best:
-            L("[stables-scan] No candidate passed current filters.")
-            L(f"[stables-scan] Log saved: {logp}")
-            return
+def _size_from_notional(product: ProductSpec, price: Decimal, target_notional_usd: Decimal) -> Decimal:
+    if price <= 0:
+        return q("0")
+    raw = target_notional_usd / price
+    sized = round_size(raw, product.base_inc, mode="down")
+    if product.min_size > 0 and sized < product.min_size:
+        sized = round_size(product.min_size, product.base_inc, mode="up")
+    return sized
 
-        L("--- Selected candidate ---")
-        L(f"product_id: {best['product_id']}")
-        L(f"bid={fmt(best['bid'])} ask={fmt(best['ask'])} "
-          f"spread={fmt(best['spread'])} ({float(best['spread_bps']):.2f} bps) tick={fmt(best['tick'])}")
-        L(f"mean={fmt(best['mean'])} std={fmt(best['std'])} z={fmt(best['z'])} hl_min={best['hl']:.2f}")
-        L(f"[stables-scan] Log saved: {logp}")
+
+def _clears_cost_gate(dev_bps: Decimal) -> bool:
+    delta_star = TAKER_BPS + SLIPPAGE_BPS + SAFETY_BPS
+    return abs(dev_bps) >= (ENTRY_BPS + delta_star)
+
+
+def _screen() -> Tuple[List[dict], Optional[Candidate]]:
+    rows = []
+    best: Optional[Candidate] = None
+
+    if not ok_to_trade_now():
+        return rows, None
+
+    for spec in _list_stable_products():
+        try:
+            bid, ask = cb_pub.get_best_bid_ask(spec.product_id)
+            dev = _deviation_bps(spec, bid, ask)
+        except Exception as e:
+            rows.append({"product_id": spec.product_id, "status": f"skip: {e}"})
+            continue
+
+        side = "BUY" if dev <= -ENTRY_BPS else ("SELL" if dev >= ENTRY_BPS else "")
+        if not side:
+            rows.append({"product_id": spec.product_id, "deviation_bps": f"{dev:.4f}", "status": "no-signal"})
+            continue
+
+        if not _clears_cost_gate(dev):
+            rows.append({"product_id": spec.product_id, "deviation_bps": f"{dev:.4f}", "status": "fails Δ* gate"})
+            continue
+
+        entry, tp, sl = _price_targets(spec, side, bid, ask)
+        size = _size_from_notional(spec, entry, TARGET_NOTIONAL_USD)
+
+        rr = abs(tp - entry) / max(q("0.00000001"), abs(entry - sl))
+
+        rows.append({
+            "product_id": spec.product_id,
+            "side": side,
+            "bid": f"{bid:f}",
+            "ask": f"{ask:f}",
+            "deviation_bps": f"{dev:.4f}",
+            "entry": f"{entry:f}",
+            "tp": f"{tp:f}",
+            "sl": f"{sl:f}",
+            "base_size": f"{size:f}",
+            "rr": f"{rr:.3f}",
+            "status": "candidate",
+        })
+
+        # choose most extreme deviation
+        if size > 0 and (best is None or abs(dev) > abs(best.deviation_bps)):
+            best = Candidate(
+                product_id=spec.product_id,
+                side=side,
+                entry_price=entry,
+                tp_price=tp,
+                sl_trigger=sl,
+                base_size=size,
+                deviation_bps=dev,
+                rr=rr
+            )
+
+    return rows, best
+
+
+def _write_csv(path: Path, fieldnames: List[str], rows: List[dict]) -> None:
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def main() -> None:
+    rows, best = _screen()
+
+    # diagnostics table
+    diag_fields = ["product_id", "side", "bid", "ask", "deviation_bps", "entry", "tp", "sl", "base_size", "rr", "status"]
+    _write_csv(OUTPUT_DIR / "screen_latest.csv", diag_fields, rows)
+
+    if not best:
+        print("[stables] No candidate passed filters (Δ* gate / signal). See diagnostics:", OUTPUT_DIR / "screen_latest.csv")
+        # clear any stale ticket
+        ticket = OUTPUT_DIR / "trade_tickets_latest.csv"
+        if ticket.exists():
+            ticket.unlink()
+        return
+
+    # trade ticket for live runner
+    ticket_fields = ["ts", "product_id", "side", "entry_price", "tp_price", "stop_trigger", "base_size", "hold_minutes", "kill_bps"]
+    _write_csv(
+        OUTPUT_DIR / "trade_tickets_latest.csv",
+        ticket_fields,
+        [{
+            "ts": int(time.time()),
+            "product_id": best.product_id,
+            "side": best.side,
+            "entry_price": f"{best.entry_price:f}",
+            "tp_price": f"{best.tp_price:f}",
+            "stop_trigger": f"{best.sl_trigger:f}",
+            "base_size": f"{best.base_size:f}",
+            "hold_minutes": HOLD_MINUTES,
+            "kill_bps": f"{KILL_BPS:f}",
+        }],
+    )
+
+    print("[stables] Candidate:", best.product_id, best.side,
+          "entry=", best.entry_price, "tp=", best.tp_price, "sl=", best.sl_trigger,
+          "size=", best.base_size, "dev_bps=", f"{best.deviation_bps:.2f}", "RR=", f"{best.rr:.2f}")
+    print("[stables] Files written to", OUTPUT_DIR)
+
 
 if __name__ == "__main__":
     main()
