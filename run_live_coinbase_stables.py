@@ -3,22 +3,12 @@
 Stable-pair mean-reversion live submitter (Coinbase Advanced)
 
 - Reads output_stables/trade_tickets_latest.csv
-- Validates product increments and sizes
-- Submits a post-only LIMIT entry with an attached trigger_bracket_gtc (TP limit + SL trigger)
-- Ensures TP>entry and SL<entry (long) after rounding / nudging
-- Uses idempotent client_order_id
+- Validates increments/min sizes and nudges prices to keep inequalities post-rounding
+- Submits post-only LIMIT parent with attached trigger_bracket_gtc (TP limit + SL trigger)
+- Idempotent client_order_id
 
-This runner assumes your private client exposes ONE of these call surfaces:
-
-1) broker.coinbase_private.trigger_bracket_limit_maker(
-       product_id, side, base_size, entry_price, tp_limit_price, stop_trigger_price, client_order_id
-   ) -> dict
-
-2) broker.coinbase_private.add_order_limit_with_bracket(
-       product_id=..., side=..., base_size=..., limit_price=..., tp_limit_price=..., stop_trigger_price=..., post_only=True, client_order_id=...
-   ) -> dict
-
-If your method name differs, add a small adapter below.
+Fixes:
+- Avoid 'utils' package shadowing by using owcg_utils.precision
 """
 
 from __future__ import annotations
@@ -30,11 +20,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Tuple
 
-from utils.precision import q, round_price, round_size
+# --- Ensure project root is on sys.path when running as a script ---
+import sys as _sys, os as _os
+_PROJECT_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+if _PROJECT_ROOT not in _sys.path:
+    _sys.path.insert(0, _PROJECT_ROOT)
+
+from owcg_utils.precision import q, round_price, round_size
 from risk.healthchecks import ok_to_trade_now
 from broker import coinbase_public as cb_pub
 
-# Try to import a placement function from your private client
+# Try to import your private placement function
 try:
     from broker.coinbase_private import trigger_bracket_limit_maker as _submit_bracket
 except Exception:
@@ -59,9 +55,6 @@ def _load_ticket() -> dict:
 
 
 def _product_specs(product_id: str) -> Tuple[Decimal, Decimal, Decimal]:
-    """
-    Return (base_increment, quote_increment, min_size)
-    """
     prods = cb_pub.get_products()
     for p in prods:
         if p["product_id"] == product_id:
@@ -75,13 +68,12 @@ def _product_specs(product_id: str) -> Tuple[Decimal, Decimal, Decimal]:
 def _validate_and_nudge(product_id: str, side: str, entry: Decimal, tp: Decimal, sl: Decimal, size: Decimal):
     base_inc, quote_inc, min_size = _product_specs(product_id)
 
-    # Rounding + nudges
     entry = round_price(entry, quote_inc, "down" if side == "BUY" else "up")
-    tp    = round_price(tp, quote_inc, "up" if side == "BUY" else "down")
-    sl    = round_price(sl, quote_inc, "down" if side == "BUY" else "up")
-    size  = round_size(size, base_inc, "down")
+    tp    = round_price(tp,    quote_inc, "up"   if side == "BUY" else "down")
+    sl    = round_price(sl,    quote_inc, "down" if side == "BUY" else "up")
+    size  = round_size(size,   base_inc,  "down")
 
-    # Ensure inequalities post rounding
+    # Ensure logical inequalities after rounding
     if side == "BUY":
         if tp <= entry:
             tp = round_price(entry + quote_inc, quote_inc, "up")
@@ -93,7 +85,6 @@ def _validate_and_nudge(product_id: str, side: str, entry: Decimal, tp: Decimal,
         if sl <= entry:
             sl = round_price(entry + quote_inc, quote_inc, "up")
 
-    # Min size
     if min_size > 0 and size < min_size:
         size = round_size(min_size, base_inc, "up")
 
@@ -113,20 +104,18 @@ def main() -> None:
     product_id = t["product_id"]
     side = t["side"].upper()
     entry = q(t["entry_price"])
-    tp = q(t["tp_price"])
-    sl = q(t["stop_trigger"])
-    size = q(t["base_size"])
+    tp    = q(t["tp_price"])
+    sl    = q(t["stop_trigger"])
+    size  = q(t["base_size"])
     hold_minutes = int(t.get("hold_minutes", "180"))
 
-    # Pre-flight validate increments / size and nudge if needed
     entry, tp, sl, size = _validate_and_nudge(product_id, side, entry, tp, sl, size)
 
-    # Confirm current bid/ask still compatible (avoid chasing)
     bid, ask = cb_pub.get_best_bid_ask(product_id)
     if side == "BUY" and entry > bid:
-        print(f"[stables-live] Entry {entry} > best bid {bid}; will rest and wait (post-only).")
+        print(f"[stables-live] Entry {entry} > best bid {bid}; will rest as maker and wait.")
     if side == "SELL" and entry < ask:
-        print(f"[stables-live] Entry {entry} < best ask {ask}; will rest and wait (post-only).")
+        print(f"[stables-live] Entry {entry} < best ask {ask}; will rest as maker and wait.")
 
     client_order_id = f"stables-{product_id}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
@@ -147,7 +136,7 @@ def main() -> None:
             client_order_id=client_order_id,
         )
         print("[stables-live] Order response:", resp)
-        print(f"[stables-live] Hold budget: {hold_minutes} minutes (runner/ops should manage time-out exits).")
+        print(f"[stables-live] Hold budget: {hold_minutes} minutes.")
     except Exception as e:
         print("[stables-live] ERROR placing order:", repr(e), file=sys.stderr)
         sys.exit(2)

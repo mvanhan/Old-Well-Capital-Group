@@ -2,23 +2,27 @@
 """
 Stable-pair mean-reversion screener (Coinbase Advanced)
 
-- Discovers the stable-pair universe programmatically (fx_stablecoin==True)
-- Computes deviation from $1.0000 (USD-quoted) or from parity on stable-stable crosses
-- Selects the best candidate that clears cost gates and risk filters
+- Discovers the stable-pair universe programmatically (fx_stablecoin==True),
+  with a robust heuristic fallback (USD-quoted stables, stable-stable crosses, WBTC/BTC).
+- Computes deviation from $1.0000 (USD-quoted) or from parity on stable-stable crosses.
+- Selects the best candidate that clears cost gates and risk filters.
 - Writes:
     output_stables/screen_latest.csv
     output_stables/trade_tickets_latest.csv   # consumed by run_live_coinbase_stables.py
 
-Key fixes vs prior version:
-- Guarantees TP > entry and SL < entry after rounding (tick nudge)
-- Uses post-only assumptions; requires |Δ| >= entry_bps + safety_margin
-- Pre-flights product increments and min sizes before ticket creation
-- No Kraken imports; Coinbase-only code path
+Key behavior:
+- Uses owcg_utils.precision (avoids 'utils' module shadowing).
+- Guarantees TP > entry and SL < entry (long) after rounding/nudging (and vice versa for shorts).
+- Post-only assumptions; requires |Δ| >= entry_bps + safety/cost gate.
+- Coinbase-only; no Kraken imports.
+- CLI overrides for thresholds (no need to edit the file).
 
-NOTE: This is a *scanner*. It does NOT place orders.
+Example:
+  python run_strategy_stables.py --entry 3 --exit 1 --safety 0.5 --slip 0.3 --kill 100 --hold 180 --notional 25
 """
 
 from __future__ import annotations
+import argparse
 import csv
 import os
 import time
@@ -27,34 +31,39 @@ from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# --- Local modules (new small helpers) ---
-from utils.precision import q, round_price, round_size
+# --- Ensure project root is on sys.path when running as a script ---
+import sys, os as _os
+_PROJECT_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+# --- Local helpers ---
+from owcg_utils.precision import q, round_price, round_size
 from risk.healthchecks import ok_to_trade_now
 
-# ---- Your existing public broker expected surface ----
-# Must provide:
-#   - get_products(): List[dict] each with product_id, base_increment, quote_increment, min_order_size, fx_stablecoin (bool), base_name, quote_name
-#   - get_best_bid_ask(product_id) -> Tuple[Decimal, Decimal]
+# ---- Public broker surface (must exist in your repo) ----
+#   - get_products(): List[dict] with product_id, base_increment, quote_increment, min_order_size, fx_stablecoin, base_name, quote_name
+#   - get_best_bid_ask(product_id) -> (Decimal bid, Decimal ask)
 from broker import coinbase_public as cb_pub
 
 OUTPUT_DIR = Path("output_stables")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---- Strategy params (tweak here or move to config.stables.yaml) ----
-ENTRY_BPS = q("10")         # enter when discount <= -10 bps (or ratio deviation ≥ +10 bps for the short leg)
-EXIT_BPS  = q("2")          # target exit near parity (+2 bps room to be lifted)
-SAFETY_BPS = q("5")         # extra buffer above cost floor
-KILL_BPS  = q("100")        # flatten if deviation widens beyond -100 bps (true stress)
-HOLD_MINUTES = 180          # time budget; runner will enforce
-TARGET_NOTIONAL_USD = q("25")  # small tickets while validating live behavior
+# ---- DEFAULT strategy params: Option A (gate ≈ 3.8 bps) ----
+DEFAULT_ENTRY_BPS        = q("3")      # enter when |deviation| ≥ 3 bps
+DEFAULT_EXIT_BPS         = q("1")      # rest TP ~ +1 bp (long) / -1 bp (short)
+DEFAULT_SAFETY_BPS       = q("0.5")    # cushion above cost floor
+DEFAULT_KILL_BPS         = q("100")    # stop trigger at 100 bps from parity
+DEFAULT_HOLD_MINUTES     = 180
+DEFAULT_TARGET_NOTIONAL  = q("25")
+DEFAULT_TAKER_BPS        = q("0")      # maker-only assumption
+DEFAULT_SLIPPAGE_BPS     = q("0.3")    # tiny buffer for a tick of noise
 
-# Costs/guards for gate calculation
-TAKER_BPS = q("0")          # assume 0 if you truly avoid taker; scanner still adds safety buffer
-SLIPPAGE_BPS = q("1")       # conservative one-tick-ish cushion
-
-# Universe filters
-ALLOW_STABLE_STABLE = True  # allow USDC/DAI etc if listed as a product
-USD_LIKE = {"USD"}          # treat USD/USDC books as absolute-par targets
+# Universe behavior
+ALLOW_STABLE_STABLE_HEURISTIC = True   # include stable-stable crosses even if fx_stablecoin flag is absent
+ALLOW_WBTC_BTC                = True   # treat WBTC/BTC as parity pair
+USD_LIKE = {"USD"}
+STABLE_SET = {"USDC", "USDT", "DAI", "PYUSD", "USDP"}
 
 
 @dataclass
@@ -80,10 +89,52 @@ class Candidate:
     rr: Decimal
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Stable-pair mean-reversion screener")
+    p.add_argument("--entry", type=str, default=str(DEFAULT_ENTRY_BPS), help="Entry threshold in bps (abs deviation)")
+    p.add_argument("--exit", type=str, default=str(DEFAULT_EXIT_BPS), help="Exit target in bps from parity")
+    p.add_argument("--safety", type=str, default=str(DEFAULT_SAFETY_BPS), help="Safety cushion (bps) added to cost gate")
+    p.add_argument("--slip", type=str, default=str(DEFAULT_SLIPPAGE_BPS), help="Expected slippage (bps)")
+    p.add_argument("--taker", type=str, default=str(DEFAULT_TAKER_BPS), help="Taker cost (bps) assumed in cost gate")
+    p.add_argument("--kill", type=str, default=str(DEFAULT_KILL_BPS), help="Kill-zone stop distance (bps)")
+    p.add_argument("--hold", type=int, default=int(DEFAULT_HOLD_MINUTES), help="Hold time budget (minutes)")
+    p.add_argument("--notional", type=str, default=str(DEFAULT_TARGET_NOTIONAL), help="Target notional USD per trade")
+    p.add_argument("--show-gate", action="store_true", help="Print the active gate (Δ* and total bps required)")
+    return p.parse_args()
+
+
+def _should_include_product(p: dict) -> bool:
+    """Return True if product belongs in the stable-pair universe."""
+    if p.get("fx_stablecoin"):
+        return True
+    if not ALLOW_STABLE_STABLE_HEURISTIC:
+        return False
+
+    base = (p.get("base_name") or "").upper()
+    quote = (p.get("quote_name") or "").upper()
+    pid = p.get("product_id", "").upper()
+
+    # Heuristic 1: USD-quoted stables
+    if quote in USD_LIKE and base in STABLE_SET:
+        return True
+
+    # Heuristic 2: stable-stable crosses (e.g., USDC/DAI if listed)
+    if base in STABLE_SET and quote in STABLE_SET:
+        return True
+
+    # Heuristic 3: WBTC/BTC pair
+    if ALLOW_WBTC_BTC and (
+        (base == "WBTC" and quote == "BTC") or (base == "BTC" and quote == "WBTC") or ("WBTC-BTC" in pid)
+    ):
+        return True
+
+    return False
+
+
 def _list_stable_products() -> List[ProductSpec]:
-    specs = []
+    specs: List[ProductSpec] = []
     for p in cb_pub.get_products():
-        if not p.get("fx_stablecoin"):
+        if not _should_include_product(p):
             continue
         product_id = p["product_id"]
         base = p.get("base_name") or p.get("base_currency") or product_id.split("-")[0]
@@ -91,37 +142,33 @@ def _list_stable_products() -> List[ProductSpec]:
         base_inc = q(p.get("base_increment", "0.00000001"))
         quote_inc = q(p.get("quote_increment", "0.00000001"))
         min_size = q(p.get("min_order_size", p.get("base_min_size", "0.0")) or "0.0")
-        specs.append(ProductSpec(product_id, base, quote, base_inc, quote_inc, min_size, True))
+        specs.append(ProductSpec(product_id, base, quote, base_inc, quote_inc, min_size, bool(p.get("fx_stablecoin"))))
     return specs
 
 
 def _deviation_bps(product: ProductSpec, bid: Decimal, ask: Decimal) -> Decimal:
-    """
-    For USD-quoted: deviation from $1 mid in bps (mid-1)*1e4
-    For stable-stable crosses: deviation from parity (mid - parity)*1e4, parity≈1
-    """
     mid = (bid + ask) / 2
-    if product.quote in USD_LIKE and product.base.upper() in {"USDC","DAI","USDT","PYUSD","USDP"}:
+    # For USD-quoted stables, parity is 1.0000 USD
+    if product.quote.upper() in USD_LIKE and product.base.upper() in (STABLE_SET | {"WBTC", "BTC"}):
         return (mid - q("1")) * q("10000")
-    # generic parity target for stable-stable (ratio)
+    # Generic parity for stable-stable crosses (including WBTC/BTC treated as parity)
     return (mid - q("1")) * q("10000")
 
 
-def _price_targets(product: ProductSpec, side: str, bid: Decimal, ask: Decimal) -> Tuple[Decimal, Decimal]:
+def _price_targets(
+    product: ProductSpec, side: str, bid: Decimal, ask: Decimal,
+    ENTRY_BPS: Decimal, EXIT_BPS: Decimal, KILL_BPS: Decimal
+) -> tuple[Decimal, Decimal, Decimal]:
     """
-    Compute candidate entry price (maker), TP near parity, and SL trigger at KILL_BPS.
-    Enforce tick rounding + one-tick nudge to guarantee TP>entry (long) or TP<entry (short).
+    Compute entry, TP (near parity), SL (kill) with tick rounding and inequality nudges.
     """
-    # Entry target at best bid (BUY) or best ask (SELL), then nudge *inside* as maker
     if side == "BUY":
         raw_entry = min(bid, q("1") - ENTRY_BPS / q("10000"))
         entry = round_price(raw_entry, product.quote_inc, mode="down")
-        # TP near 1.0000 + EXIT_BPS (resting ask)
         raw_tp = q("1") + EXIT_BPS / q("10000")
         tp = round_price(raw_tp, product.quote_inc, mode="up")
         if tp <= entry:
             tp = round_price(entry + product.quote_inc, product.quote_inc, mode="up")
-        # SL trigger at 1.0000 - KILL_BPS
         raw_sl = q("1") - KILL_BPS / q("10000")
         sl = round_price(raw_sl, product.quote_inc, mode="down")
         if sl >= entry:
@@ -151,12 +198,13 @@ def _size_from_notional(product: ProductSpec, price: Decimal, target_notional_us
     return sized
 
 
-def _clears_cost_gate(dev_bps: Decimal) -> bool:
+def _clears_cost_gate(dev_bps: Decimal, ENTRY_BPS: Decimal, SAFETY_BPS: Decimal, TAKER_BPS: Decimal, SLIPPAGE_BPS: Decimal) -> bool:
     delta_star = TAKER_BPS + SLIPPAGE_BPS + SAFETY_BPS
     return abs(dev_bps) >= (ENTRY_BPS + delta_star)
 
 
-def _screen() -> Tuple[List[dict], Optional[Candidate]]:
+def _screen(ENTRY_BPS: Decimal, EXIT_BPS: Decimal, SAFETY_BPS: Decimal, KILL_BPS: Decimal,
+            HOLD_MINUTES: int, TARGET_NOTIONAL_USD: Decimal, TAKER_BPS: Decimal, SLIPPAGE_BPS: Decimal):
     rows = []
     best: Optional[Candidate] = None
 
@@ -176,41 +224,24 @@ def _screen() -> Tuple[List[dict], Optional[Candidate]]:
             rows.append({"product_id": spec.product_id, "deviation_bps": f"{dev:.4f}", "status": "no-signal"})
             continue
 
-        if not _clears_cost_gate(dev):
+        if not _clears_cost_gate(dev, ENTRY_BPS, SAFETY_BPS, TAKER_BPS, SLIPPAGE_BPS):
             rows.append({"product_id": spec.product_id, "deviation_bps": f"{dev:.4f}", "status": "fails Δ* gate"})
             continue
 
-        entry, tp, sl = _price_targets(spec, side, bid, ask)
+        entry, tp, sl = _price_targets(spec, side, bid, ask, ENTRY_BPS, EXIT_BPS, KILL_BPS)
         size = _size_from_notional(spec, entry, TARGET_NOTIONAL_USD)
-
         rr = abs(tp - entry) / max(q("0.00000001"), abs(entry - sl))
 
         rows.append({
-            "product_id": spec.product_id,
-            "side": side,
-            "bid": f"{bid:f}",
-            "ask": f"{ask:f}",
+            "product_id": spec.product_id, "side": side,
+            "bid": f"{bid:f}", "ask": f"{ask:f}",
             "deviation_bps": f"{dev:.4f}",
-            "entry": f"{entry:f}",
-            "tp": f"{tp:f}",
-            "sl": f"{sl:f}",
-            "base_size": f"{size:f}",
-            "rr": f"{rr:.3f}",
-            "status": "candidate",
+            "entry": f"{entry:f}", "tp": f"{tp:f}", "sl": f"{sl:f}",
+            "base_size": f"{size:f}", "rr": f"{rr:.3f}", "status": "candidate",
         })
 
-        # choose most extreme deviation
         if size > 0 and (best is None or abs(dev) > abs(best.deviation_bps)):
-            best = Candidate(
-                product_id=spec.product_id,
-                side=side,
-                entry_price=entry,
-                tp_price=tp,
-                sl_trigger=sl,
-                base_size=size,
-                deviation_bps=dev,
-                rr=rr
-            )
+            best = Candidate(spec.product_id, side, entry, tp, sl, size, dev, rr)
 
     return rows, best
 
@@ -224,37 +255,50 @@ def _write_csv(path: Path, fieldnames: List[str], rows: List[dict]) -> None:
 
 
 def main() -> None:
-    rows, best = _screen()
+    args = parse_args()
 
-    # diagnostics table
+    ENTRY_BPS        = q(args.entry)
+    EXIT_BPS         = q(args.exit)
+    SAFETY_BPS       = q(args.safety)
+    SLIPPAGE_BPS     = q(args.slip)
+    TAKER_BPS        = q(args.taker)
+    KILL_BPS         = q(args.kill)
+    HOLD_MINUTES     = int(args.hold)
+    TARGET_NOTIONAL_USD = q(args.notional)
+
+    if args.show_gate:
+        delta_star = TAKER_BPS + SLIPPAGE_BPS + SAFETY_BPS
+        total_gate = ENTRY_BPS + delta_star
+        print(f"[stables] Active gate: Δ*={delta_star:.3f} bps; require |Δ| ≥ {total_gate:.3f} bps  "
+              f"(entry={ENTRY_BPS} safety={SAFETY_BPS} slip={SLIPPAGE_BPS} taker={TAKER_BPS})")
+
+    rows, best = _screen(
+        ENTRY_BPS, EXIT_BPS, SAFETY_BPS, KILL_BPS,
+        HOLD_MINUTES, TARGET_NOTIONAL_USD, TAKER_BPS, SLIPPAGE_BPS
+    )
+
     diag_fields = ["product_id", "side", "bid", "ask", "deviation_bps", "entry", "tp", "sl", "base_size", "rr", "status"]
     _write_csv(OUTPUT_DIR / "screen_latest.csv", diag_fields, rows)
 
+    ticket_path = OUTPUT_DIR / "trade_tickets_latest.csv"
     if not best:
-        print("[stables] No candidate passed filters (Δ* gate / signal). See diagnostics:", OUTPUT_DIR / "screen_latest.csv")
-        # clear any stale ticket
-        ticket = OUTPUT_DIR / "trade_tickets_latest.csv"
-        if ticket.exists():
-            ticket.unlink()
+        print("[stables] No candidate passed filters. See diagnostics:", OUTPUT_DIR / "screen_latest.csv")
+        if ticket_path.exists():
+            ticket_path.unlink()
         return
 
-    # trade ticket for live runner
     ticket_fields = ["ts", "product_id", "side", "entry_price", "tp_price", "stop_trigger", "base_size", "hold_minutes", "kill_bps"]
-    _write_csv(
-        OUTPUT_DIR / "trade_tickets_latest.csv",
-        ticket_fields,
-        [{
-            "ts": int(time.time()),
-            "product_id": best.product_id,
-            "side": best.side,
-            "entry_price": f"{best.entry_price:f}",
-            "tp_price": f"{best.tp_price:f}",
-            "stop_trigger": f"{best.sl_trigger:f}",
-            "base_size": f"{best.base_size:f}",
-            "hold_minutes": HOLD_MINUTES,
-            "kill_bps": f"{KILL_BPS:f}",
-        }],
-    )
+    _write_csv(ticket_path, ticket_fields, [{
+        "ts": int(time.time()),
+        "product_id": best.product_id,
+        "side": best.side,
+        "entry_price": f"{best.entry_price:f}",
+        "tp_price": f"{best.tp_price:f}",
+        "stop_trigger": f"{best.sl_trigger:f}",
+        "base_size": f"{best.base_size:f}",
+        "hold_minutes": HOLD_MINUTES,
+        "kill_bps": f"{KILL_BPS:f}",
+    }])
 
     print("[stables] Candidate:", best.product_id, best.side,
           "entry=", best.entry_price, "tp=", best.tp_price, "sl=", best.sl_trigger,

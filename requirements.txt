@@ -1,9 +1,6 @@
-pandas
-requests
+coinbase-advanced-py
 PyYAML
 python-dotenv
-websocket-client
-certifi
-
-# Coinbase Advanced Trade SDK (handles auth + request signing)
-coinbase-advanced-py>=1.8.2
+tenacity
+pycoingecko
+requests
