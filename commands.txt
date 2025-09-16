@@ -1,10 +1,16 @@
 LAST=""
 while true; do
-  python3 -m dotenv -f .env run -- python3 run_strategy_stables.py
+  python3 -m dotenv -f .env run -- python3 -u run_strategy_stables.py
   if [ -s output_stables/trade_tickets_latest.csv ]; then
-    CUR=$((command -v md5 >/dev/null 2>&1 && md5 -q output_stables/trade_tickets_latest.csv) || (md5sum output_stables/trade_tickets_latest.csv | awk '{print $1}'))
+    CUR=$(
+      if command -v md5 >/dev/null 2>&1; then
+        md5 -q output_stables/trade_tickets_latest.csv
+      else
+        md5sum output_stables/trade_tickets_latest.csv | awk '{print $1}'
+      fi
+    )
     if [ "$CUR" != "$LAST" ]; then
-      python3 -m dotenv -f .env run -- python3 run_live_coinbase_stables.py && LAST="$CUR"
+      python3 -m dotenv -f .env run -- python3 -u run_live_coinbase_stables.py && LAST="$CUR"
     fi
   fi
   sleep 15
