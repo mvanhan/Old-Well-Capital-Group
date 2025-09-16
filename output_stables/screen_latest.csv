@@ -1,1 +1,2 @@
 product_id,side,bid,ask,deviation_bps,entry,tp,sl,base_size,rr,status
+DAI-USDC,,,,,,,,,,skip: 'GetProductBookResponse' object has no attribute 'get'
