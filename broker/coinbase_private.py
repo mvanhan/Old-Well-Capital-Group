@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from decimal import Decimal
 from typing import Optional, Dict, Any
 
 try:
@@ -14,30 +15,17 @@ except Exception as e:  # pragma: no cover
         "Install with: pip install coinbase-advanced-py"
     ) from e
 
-# Configurable timeouts (seconds)
-SDK_TIMEOUT = float(os.getenv("CB_SDK_TIMEOUT", "10"))
+SDK_TIMEOUT = float(os.getenv("COINBASE_SDK_TIMEOUT", "10"))
 
-def _to_dict(obj):
-    """Convert SDK response objects to plain dict when possible."""
-    if hasattr(obj, "to_dict"):
-        try:
-            return obj.to_dict()
-        except Exception:
-            pass
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump()
-        except Exception:
-            pass
-    return obj
+def _to_dict(resp):
+    return resp.to_dict() if hasattr(resp, "to_dict") else resp
 
 def _client() -> RESTClient:
-    """Construct a REST client using env creds with an explicit timeout."""
-    api_key = os.getenv("COINBASE_API_KEY")
-    api_secret = os.getenv("COINBASE_API_SECRET")
+    api_key = os.getenv("COINBASE_API_KEY") or os.getenv("COINBASE_API_KEY_ID")
+    api_secret = os.getenv("COINBASE_API_SECRET") or os.getenv("COINBASE_PRIVATE_KEY")
     if not api_key or not api_secret:
-        raise RuntimeError("COINBASE_API_KEY / COINBASE_API_SECRET are required in .env")
-    return RESTClient(api_key=api_key, api_secret=api_secret, timeout=SDK_TIMEOUT)
+        raise RuntimeError("Missing Coinbase API credentials in environment.")
+    return RESTClient(key=api_key, secret=api_secret, timeout=SDK_TIMEOUT)
 
 def add_order_limit_with_bracket(
     *,
@@ -55,45 +43,67 @@ def add_order_limit_with_bracket(
       - Parent: maker-only LIMIT (BUY or SELL)
       - Attached: trigger_bracket_gtc with {limit_price, stop_trigger_price}
 
-    Matches the signature expected by run_live_coinbase_stables.py.
-    Returns the Coinbase API response as a plain dict.
+    Returns the Coinbase response as a dict.
     """
     cl = _client()
     if client_order_id is None:
-        client_order_id = f"owcg-{uuid.uuid4().hex[:16]}"
-
-    # Coinbase Advanced expects this shape for a limit parent order:
-    order_cfg = {
-        "limit_limit_gtc": {
-            "base_size": str(base_size),
-            "limit_price": str(limit_price),
-            "post_only": bool(post_only),
-        }
-    }
-
+        client_order_id = str(uuid.uuid4())
     payload = {
         "client_order_id": client_order_id,
         "product_id": product_id,
-        "side": side.upper(),  # "BUY" or "SELL"
-        "order_configuration": order_cfg,
-        "attached_order_configuration": {
+        "side": side.upper(),
+        "order_configuration": {
+            "limit_limit_gtc": {
+                "post_only": post_only,
+                "base_size": base_size,
+                "limit_price": limit_price,
+            },
             "trigger_bracket_gtc": {
-                "limit_price": str(tp_limit_price),
-                "stop_trigger_price": str(stop_trigger_price),
-            }
+                "take_profit": {"limit_price": tp_limit_price},
+                "stop_loss":   {"stop_trigger_price": stop_trigger_price},
+            },
         },
     }
-
     resp = cl.post("/api/v3/brokerage/orders", data=payload)
     return _to_dict(resp)
 
-# Backwards-/alternate-name compatibility expected by the live runner:
-def trigger_bracket_limit_maker(**kwargs) -> Dict[str, Any]:
-    """Alias to add_order_limit_with_bracket for compatibility."""
-    return add_order_limit_with_bracket(**kwargs)
+def trigger_bracket_limit_maker(*, product_id, side, base_size, limit_price, tp_limit_price, stop_trigger_price, client_order_id=None):
+    return add_order_limit_with_bracket(
+        product_id=product_id,
+        side=side,
+        base_size=base_size,
+        limit_price=limit_price,
+        tp_limit_price=tp_limit_price,
+        stop_trigger_price=stop_trigger_price,
+        post_only=True,
+        client_order_id=client_order_id,
+    )
 
-# Optional convenience (not required by the live runner)
 def get_order(order_id: str) -> Dict[str, Any]:
     cl = _client()
-    o = cl.get_order(order_id=order_id)
-    return _to_dict(o)
+    resp = cl.get(f"/api/v3/brokerage/orders/historical/{order_id}")
+    return _to_dict(resp)
+
+def cancel_order(order_id: str) -> Dict[str, Any]:
+    """
+    Cancel a single order by id.
+    """
+    cl = _client()
+    resp = cl.post("/api/v3/brokerage/orders/batch_cancel", data={"order_ids": [order_id]})
+    return _to_dict(resp)
+
+def get_available(currency: str) -> Decimal:
+    """
+    Return available balance for a given currency (e.g., 'USD', 'USDC').
+    """
+    cl = _client()
+    acc = cl.get_accounts()
+    d = _to_dict(acc)
+    for a in d.get("accounts", []):
+        if a.get("currency") == currency:
+            bal = a.get("available_balance") or {}
+            try:
+                return Decimal(str(bal.get("value", "0")))
+            except Exception:
+                return Decimal("0")
+    return Decimal("0")

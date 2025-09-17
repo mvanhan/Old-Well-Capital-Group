@@ -6,6 +6,7 @@ Stable-pair mean-reversion live submitter (Coinbase Advanced)
 - Validates increments/min sizes and nudges prices to keep inequalities post-rounding
 - Submits post-only LIMIT parent with attached trigger_bracket_gtc (TP limit + SL trigger)
 - Idempotent client_order_id
+- Exposes a callable `place_from_ticket()` so other modules (like the controller) can reuse the logic.
 
 Fixes:
 - Avoid 'utils' package shadowing by using owcg_utils.precision
@@ -13,93 +14,87 @@ Fixes:
 
 from __future__ import annotations
 import csv
+import os
 import sys
 import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
-from typing import Tuple
-
-# --- Ensure project root is on sys.path when running as a script ---
-import sys as _sys, os as _os
-_PROJECT_ROOT = _os.path.dirname(_os.path.abspath(__file__))
-if _PROJECT_ROOT not in _sys.path:
-    _sys.path.insert(0, _PROJECT_ROOT)
+from typing import Dict, Any, Tuple
 
 from owcg_utils.precision import q, round_price, round_size
-from risk.healthchecks import ok_to_trade_now
 from broker import coinbase_public as cb_pub
+from broker import coinbase_private as cb_priv
 
-# Try to import your private placement function
-try:
-    from broker.coinbase_private import trigger_bracket_limit_maker as _submit_bracket
-except Exception:
-    _submit_bracket = None
-if _submit_bracket is None:
-    try:
-        from broker.coinbase_private import add_order_limit_with_bracket as _submit_bracket  # type: ignore
-    except Exception:
-        _submit_bracket = None
+OUTDIR = Path("output_stables")
+LOGDIR = Path("logs")
+LOGDIR.mkdir(exist_ok=True)
+OUTDIR.mkdir(parents=True, exist_ok=True)
 
-TICKET = Path("output_stables/trade_tickets_latest.csv")
+TICKET_PATH = OUTDIR / "trade_tickets_latest.csv"
 
-
-def _load_ticket() -> dict:
-    if not TICKET.exists():
-        raise FileNotFoundError(f"No ticket found at {TICKET}")
-    with TICKET.open() as f:
-        r = list(csv.DictReader(f))
-    if not r:
-        raise RuntimeError("Ticket CSV is empty")
-    return r[0]
-
+def _load_ticket() -> Dict[str, str]:
+    if not TICKET_PATH.exists():
+        raise FileNotFoundError(f"Ticket not found: {TICKET_PATH}")
+    with TICKET_PATH.open() as f:
+        r = csv.DictReader(f)
+        rows = list(r)
+    if not rows:
+        raise RuntimeError("Ticket CSV is empty.")
+    return rows[0]
 
 def _product_specs(product_id: str) -> Tuple[Decimal, Decimal, Decimal]:
-    prods = cb_pub.get_products()
-    for p in prods:
-        if p["product_id"] == product_id:
+    """
+    Return (base_increment, quote_increment, min_order_size) for product.
+    """
+    for p in cb_pub.get_products():
+        if p.get("product_id") == product_id:
             base_inc = q(p.get("base_increment", "0.00000001"))
             quote_inc = q(p.get("quote_increment", "0.00000001"))
-            min_size = q(p.get("min_order_size", p.get("base_min_size", "0.0")) or "0.0")
+            min_size = q(p.get("min_order_size", p.get("base_min_size", "0")) or "0")
             return base_inc, quote_inc, min_size
-    raise KeyError(f"Unknown product_id: {product_id}")
-
+    raise ValueError(f"Unknown product_id {product_id}")
 
 def _validate_and_nudge(product_id: str, side: str, entry: Decimal, tp: Decimal, sl: Decimal, size: Decimal):
     base_inc, quote_inc, min_size = _product_specs(product_id)
 
-    entry = round_price(entry, quote_inc, "down" if side == "BUY" else "up")
-    tp    = round_price(tp,    quote_inc, "up"   if side == "BUY" else "down")
-    sl    = round_price(sl,    quote_inc, "down" if side == "BUY" else "up")
-    size  = round_size(size,   base_inc,  "down")
+    # Round size DOWN to increment
+    size = round_size(size, base_inc, mode="down")
+    if size < min_size:
+        raise ValueError(f"Order size {size} < min_size {min_size} for {product_id}")
 
-    # Ensure logical inequalities after rounding
+    # Round entry to nearest tick
+    entry = round_price(entry, quote_inc, mode="nearest")
+    tp    = round_price(tp,    quote_inc, mode="nearest")
+    sl    = round_price(sl,    quote_inc, mode="nearest")
+
+    # Ensure bracket inequalities hold after rounding
+    # BUY: tp > entry and sl < entry
+    # SELL: tp < entry and sl > entry (mirror)
     if side == "BUY":
+        bid, ask = cb_pub.get_best_bid_ask(product_id)
+        if entry > bid:
+            entry = round_price(bid, quote_inc, mode="down")
         if tp <= entry:
-            tp = round_price(entry + quote_inc, quote_inc, "up")
+            tp = round_price(entry + quote_inc, quote_inc, mode="nearest")
         if sl >= entry:
-            sl = round_price(entry - quote_inc, quote_inc, "down")
+            sl = round_price(entry - quote_inc, quote_inc, mode="nearest")
     else:
+        bid, ask = cb_pub.get_best_bid_ask(product_id)
+        if entry < ask:
+            entry = round_price(ask, quote_inc, mode="up")
         if tp >= entry:
-            tp = round_price(entry - quote_inc, quote_inc, "down")
+            tp = round_price(entry - quote_inc, quote_inc, mode="nearest")
         if sl <= entry:
-            sl = round_price(entry + quote_inc, quote_inc, "up")
-
-    if min_size > 0 and size < min_size:
-        size = round_size(min_size, base_inc, "up")
+            sl = round_price(entry + quote_inc, quote_inc, mode="nearest")
 
     return entry, tp, sl, size
 
-
-def main() -> None:
-    if _submit_bracket is None:
-        print("[stables-live] ERROR: No placement function found in broker.coinbase_private.", file=sys.stderr)
-        sys.exit(2)
-
-    if not ok_to_trade_now():
-        print("[stables-live] Trading paused by health checks")
-        sys.exit(0)
-
+def place_from_ticket() -> Dict[str, Any]:
+    """
+    Load the current ticket and submit a post-only limit with trigger bracket.
+    Returns a dict with keys: order_id, client_order_id, status, product_id, side, size, entry, tp, sl
+    """
     t = _load_ticket()
     product_id = t["product_id"]
     side = t["side"].upper()
@@ -111,36 +106,49 @@ def main() -> None:
 
     entry, tp, sl, size = _validate_and_nudge(product_id, side, entry, tp, sl, size)
 
+    # Final maker sanity relative to best bid/ask
     bid, ask = cb_pub.get_best_bid_ask(product_id)
     if side == "BUY" and entry > bid:
-        print(f"[stables-live] Entry {entry} > best bid {bid}; will rest as maker and wait.")
+        entry = bid
     if side == "SELL" and entry < ask:
-        print(f"[stables-live] Entry {entry} < best ask {ask}; will rest as maker and wait.")
+        entry = ask
 
-    client_order_id = f"stables-{product_id}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+    client_order_id = f"owcg:{product_id}:{side}:{int(time.time())}:{uuid.uuid4().hex[:8]}"
+    resp = cb_priv.add_order_limit_with_bracket(
+        product_id=product_id,
+        side=side,
+        base_size=f"{size:f}",
+        limit_price=f"{entry:f}",
+        tp_limit_price=f"{tp:f}",
+        stop_trigger_price=f"{sl:f}",
+        post_only=True,
+        client_order_id=client_order_id,
+    )
 
-    print("[stables-live] Submitting:",
-          dict(product_id=product_id, side=side, base_size=str(size),
-               entry_price=str(entry), tp_price=str(tp), stop_trigger=str(sl),
-               client_order_id=client_order_id))
+    out = {
+        "product_id": product_id,
+        "side": side,
+        "size": f"{size:f}",
+        "entry": f"{entry:f}",
+        "tp": f"{tp:f}",
+        "sl": f"{sl:f}",
+        "client_order_id": client_order_id,
+        "order_id": None,
+        "status": "",
+    }
 
     try:
-        resp = _submit_bracket(
-            product_id=product_id,
-            side=side,
-            base_size=str(size),
-            limit_price=str(entry),
-            tp_limit_price=str(tp),
-            stop_trigger_price=str(sl),
-            post_only=True,
-            client_order_id=client_order_id,
-        )
-        print("[stables-live] Order response:", resp)
-        print(f"[stables-live] Hold budget: {hold_minutes} minutes.")
-    except Exception as e:
-        print("[stables-live] ERROR placing order:", repr(e), file=sys.stderr)
-        sys.exit(2)
+        d = resp if isinstance(resp, dict) else (resp.to_dict() if hasattr(resp, "to_dict") else {})
+        out["order_id"] = d.get("order_id") or d.get("order", {}).get("order_id")
+        out["status"]   = (d.get("status") or d.get("order", {}).get("status") or "").upper()
+    except Exception:
+        pass
 
+    print(f"[stables-live] Submitted {product_id} {side} size={out['size']} entry={out['entry']} tp={out['tp']} sl={out['sl']} oid={out['order_id']} status={out['status']}")
+    return out
+
+def main():
+    place_from_ticket()
 
 if __name__ == "__main__":
     main()
