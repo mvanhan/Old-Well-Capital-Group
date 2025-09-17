@@ -17,7 +17,8 @@ Notes:
 - Normalize fields so downstream code can rely on:
     product_id, base_currency, quote_currency, base_increment, quote_increment,
     price_increment, min_order (best-effort), fx_stablecoin (heuristic if missing)
-- Stable-universe inference is *tight*: base must be a stable, and quote must be USD or a stable.
+- Stable-universe inference includes all common stables including USDT, and
+  restricts to stable–USD and stable–stable pairs (excludes alt/stable).
 """
 
 import os
@@ -36,7 +37,7 @@ except Exception:  # pragma: no cover
 SDK_TIMEOUT = float(os.getenv("CB_SDK_TIMEOUT", "10"))
 HTTP_TIMEOUT = float(os.getenv("CB_HTTP_TIMEOUT", "10"))
 
-# Set of stables we care about
+# Set of stables we consider for the stable-pairs universe
 _STABLES = {"USD", "USDC", "USDT", "DAI", "PYUSD", "TUSD", "USDD", "USDP"}
 
 
@@ -68,12 +69,15 @@ def _dec(x: Any, default: str = "0") -> Decimal:
 
 def _infer_fx_stablecoin(base: str, quote: str) -> bool:
     """
-    Tight inference:
-    - Base must be a stable, and
-    - Quote must be USD or a stable
-    This excludes alt/stable crosses like ROSE-USDT.
+    Tight inference for the 'stable pairs' universe used by this strategy:
+    - Include stable–USD (e.g., USDT-USD, DAI-USD)
+    - Include stable–stable (e.g., USDT-USDC, DAI-USDC)
+    - Exclude alt/stable like ROSE-USDT or BTC-USDC
     """
-    return (base in _STABLES) and (quote in _STABLES or quote == "USD")
+    base_is_stable = base in _STABLES
+    quote_is_stable = quote in _STABLES
+    # stable–USD or stable–stable, but not alt/stable
+    return base_is_stable and (quote == "USD" or quote_is_stable)
 
 
 # ---- public API ----

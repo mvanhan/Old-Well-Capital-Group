@@ -1,31 +1,23 @@
 # config.yaml
 
-# Coinbase Advanced Trade (default path for live trading)
 coinbase:
-  # Preferred quote asset for mapping tickets to product IDs (BTC-USD, ETH-USDC, etc.)
-  # You can override via env: COINBASE_QUOTE_ASSET
   quote_asset: "USD"
 
-# Risk settings (informational + to keep in sync with brackets.target_notional_usd)
 risk:
-  bankroll_usd: 100 # starting bankroll
-  max_trade_pct: 5 # cap per trade as % of bankroll (5% of $100 = $5)
-  notes: "run_strategy.py currently sizes with brackets.target_notional_usd; keep it aligned with bankroll * max_trade_pct."
+  bankroll_usd: 100
+  max_trade_pct: 5
+  notes: "target_notional_usd should track bankroll * max_trade_pct"
 
-# Bracket behavior and sizing used by the runners/strategy
 brackets:
-  # If the trade ticket provides take_profit/stop, the runner will use them.
-  # Otherwise it derives the following (SOFTENED for stables):
-  tp_offset_bps: 10 # +0.10% above entry (10 bps)  ← was 30
-  min_stop_pct: 0.10 # -0.10% below entry (floor)   ← was 0.50
-  post_only: true # place entry as maker
-  target_notional_usd: 5 # derived from bankroll ($100) * max_trade_pct (5%) = $5
+  tp_offset_bps: 8 # <-- softened to 8 bps for testing
+  min_stop_pct: 0.10 # 10 bps floor for SL
+  post_only: true
+  target_notional_usd: 5
 
-# (Optional) Legacy venue notes for reference only
 binance:
   enabled: false
-  notes: "Deprecated for NC; switched to Coinbase Advanced."
+  notes: "Deprecated"
 
 kraken:
   enabled: false
-  notes: "Removed from strategy path; kept only as historical reference."
+  notes: "Deprecated"

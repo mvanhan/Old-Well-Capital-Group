@@ -1,3 +1,4 @@
+export PYTHONUNBUFFERED=1
 LAST=""
 while true; do
   python3 -m dotenv -f .env run -- python3 -u run_strategy_stables.py

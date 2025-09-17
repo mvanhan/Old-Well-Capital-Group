@@ -1,5 +1,5 @@
 product_id,side,bid,ask,deviation_bps,entry,tp,sl,base_size,rr,status
-USDT-USD,,,,3.6000,,,,,,fails Δ* gate
+USDT-USD,,,,3.2500,,,,,,fails Δ* gate
 USDT-USDC,,,,3.5000,,,,,,fails Δ* gate
-DAI-USDC,,,,-1.5000,,,,,,no-signal
 DAI-USD,,,,-1.5000,,,,,,no-signal
+DAI-USDC,,,,-1.5000,,,,,,no-signal
