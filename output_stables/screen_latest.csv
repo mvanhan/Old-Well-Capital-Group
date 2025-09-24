@@ -1,1 +1,1 @@
-product_id,side,bid,ask,deviation_bps,entry,tp,sl,base_size,rr,status
+product_id,side,entry_price,tp_price,stop_trigger,base_size,dev_bps,rr,ts,hold_minutes
