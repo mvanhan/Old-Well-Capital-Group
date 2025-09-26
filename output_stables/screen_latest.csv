@@ -1,1 +1,2 @@
-product_id,side,entry_price,tp_price,stop_trigger,base_size,dev_bps,rr,ts,hold_minutes
+ts,product_id,side,entry_price,tp_price,sl_price,base_size,dev_bps,rr,hold_minutes,reason,risk_dollars,notional,gate_bps,depth_note
+1758909376,USDT-USDC,NONE,,,,,7.0000,,,insufficient_balance,,,,

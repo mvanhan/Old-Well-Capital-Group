@@ -1,219 +1,166 @@
-#!/usr/bin/env python3
-"""
-Stable-pair mean-reversion screener for Coinbase Advanced.
-
-Hands-off upgrades:
-- **Bankroll-aware sizing**: target notional is a fraction of live bankroll
-  (USD + USDT + USDC ≈ $1 each), so profits auto-reinvest.
-- **Balance caps**: SELL is capped by BASE on-hand, BUY by QUOTE on-hand
-  (so you never get INSUFFICIENT).
-- **UTF-8 CSV writes** (Windows-safe).
-- Tunable via env vars or CLI flags.
-
-Default universe: USDT-USDC (you can add more later).
-
-Env knobs (all optional):
-  STABLES_PCT=0.06           # 6% of bankroll per trade (default 0.06)
-  STABLES_MIN_NOTIONAL=8     # floor per trade in $ (default 8)
-  STABLES_MAX_NOTIONAL=20    # ceiling per trade in $ (default 20)
-  STABLES_ENTRY_BPS=1        # 1.0 bps entry threshold
-  STABLES_EXIT_BPS=0.5       # 0.5 bps take-profit
-  STABLES_SAFETY_BPS=0.5
-  STABLES_SLIPPAGE_BPS=0.3
-  STABLES_TAKER_BPS=0
-  STABLES_HOLD_MINUTES=180
-"""
-
+# run_strategy_stables.py
 from __future__ import annotations
-import os, csv, time
+
+import csv
+import os
+import time
 from decimal import Decimal
-from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Dict, Any, List, Optional
 
-# Optional: auto-load .env so Windows users don't need the CLI wrapper
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).with_name(".env"), override=True)
-except Exception:
-    pass
+from strategies.stables_mean_reversion import StrategyConfig, scan_once
 
-from broker import coinbase_public as cb_pub
-from broker import coinbase_private as cb_priv
-from owcg_utils.precision import q, round_price, round_size
+# ---------------- Config ---------------- #
+SCAN_INTERVAL_SECS = int(os.getenv("OWCG_SCAN_INTERVAL", "15"))  # run every 15s by default
 
-OUTPUT_DIR = Path("output_stables")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# ---------------- Balance source (ADAPT ME to your broker) ---------------- #
+def _get_balances() -> Dict[str, Decimal]:
+    """
+    Returns a dict like {"USD": Decimal(...), "USDT": Decimal(...), "USDC": Decimal(...)}.
+    Maps to your coinbase_private.get_balances() if available; otherwise uses a safe fallback.
+    """
+    try:
+        from broker import coinbase_private as priv
+        bals = priv.get_balances()  # expect [{"currency":"USD","available":"123.45"}, ...]
+        out: Dict[str, Decimal] = {}
+        for b in bals:
+            # pick "available" if present; else "balance"
+            amt = b.get("available", b.get("balance", "0"))
+            out[b["currency"]] = Decimal(str(amt))
+        return out
+    except Exception:
+        # Fallback dummy balances (so the loop doesn't crash in dev)
+        return {"USD": Decimal("1000"), "USDT": Decimal("0"), "USDC": Decimal("0")}
 
-# --- strategy params (bps = basis points) ---
-ENTRY_BPS     = Decimal(os.getenv("STABLES_ENTRY_BPS", "1"))
-EXIT_BPS      = Decimal(os.getenv("STABLES_EXIT_BPS", "0.5"))
-SAFETY_BPS    = Decimal(os.getenv("STABLES_SAFETY_BPS", "0.5"))
-SLIPPAGE_BPS  = Decimal(os.getenv("STABLES_SLIPPAGE_BPS", "0.3"))
-TAKER_BPS     = Decimal(os.getenv("STABLES_TAKER_BPS", "0"))
-HOLD_MINUTES  = int(os.getenv("STABLES_HOLD_MINUTES", "180"))
+# ---------------- CSV helpers ---------------- #
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
-# bankroll-aware sizing
-PCT_OF_BANKROLL   = Decimal(os.getenv("STABLES_PCT", "0.06"))      # 6% default
-MIN_NOTIONAL      = Decimal(os.getenv("STABLES_MIN_NOTIONAL", "8"))
-MAX_NOTIONAL      = Decimal(os.getenv("STABLES_MAX_NOTIONAL", "20"))
+def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in row.items()}
 
-UNIVERSE = ["USDT-USDC"]  # keep it simple and reliable for your current balances
-
-def _bps_to_frac(bps: Decimal) -> Decimal:
-    return bps / Decimal(10_000)
-
-def _best_bid_ask(product_id: str) -> Tuple[Decimal, Decimal]:
-    bid, ask = cb_pub.get_best_bid_ask(product_id)
-    return q(bid), q(ask)
-
-def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+def _write_csv(path: str, rows: List[Dict[str, Any]], header: List[str]):
+    _ensure_dir(path)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
         w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow(_normalize_row(r))
 
-def _product_specs(product_id: str) -> Tuple[Decimal, Decimal, Decimal]:
-    for p in cb_pub.get_products():
-        if p.get("product_id") == product_id:
-            base_inc  = q(p.get("base_increment", "0.00000001"))
-            quote_inc = q(p.get("quote_increment", "0.00000001"))
-            min_size  = q(p.get("min_order_size", p.get("base_min_size", p.get("min_order","0")) or "0"))
-            return base_inc, quote_inc, min_size
-    return q("0.00000001"), q("0.00000001"), q("0")
+def _append_csv(path: str, row: Dict[str, Any], header: List[str]):
+    _ensure_dir(path)
+    new_file = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if new_file:
+            w.writeheader()
+        w.writerow(_normalize_row(row))
 
-def _bankroll() -> Decimal:
-    # Treat USD/USDT/USDC ~ $1 each for sizing
-    usd  = cb_priv.get_available("USD")
-    usdt = cb_priv.get_available("USDT")
-    usdc = cb_priv.get_available("USDC")
-    return usd + usdt + usdc
+# ---------------- Main loop ---------------- #
+def _build_cfg() -> StrategyConfig:
+    # Thin-margin defaults; adjust as you learn live performance.
+    return StrategyConfig(
+        products=["USDT-USDC"],         # focus on the tightest stable pair
+        exit_bps=Decimal("0.6"),
+        sl_bps=Decimal("3.0"),
+        slippage_bps=Decimal("0.2"),
+        maker_fee_bps=Decimal("0.0"),
+        taker_fee_bps=Decimal("0.0"),
+        cushion_bps=Decimal("0.2"),
+        hold_minutes=180,
+        depth_ticks=2,
+        min_depth_multiplier=Decimal("1.10"),
+        bankroll_pct=Decimal("0.10"),   # 10% bankroll target
+        min_notional=Decimal("50"),
+        max_notional=Decimal("500"),
+        out_dir="output_stables",
+    )
 
-def _target_notional_from_bankroll() -> Decimal:
-    raw = _bankroll() * PCT_OF_BANKROLL
-    # clamp to min/max (so size stays sensible with small bankroll)
-    return max(MIN_NOTIONAL, min(MAX_NOTIONAL, raw))
-
-def _cap_by_balance(product_id: str, side: str, desired_base: Decimal, entry: Decimal) -> Decimal:
-    """
-    Cap base size by balances:
-      - SELL needs BASE
-      - BUY  needs QUOTE (not always USD)
-    """
-    base, quote = product_id.split("-")
-    if side == "SELL":
-        have_base = cb_priv.get_available(base)
-        return min(desired_base, have_base)
-    else:
-        have_quote = cb_priv.get_available(quote)
-        if entry <= 0:
-            return Decimal("0")
-        max_buy_base = have_quote / entry
-        return min(desired_base, max_buy_base)
-
-def _diag_header() -> List[str]:
-    return ["product_id","side","entry_price","tp_price","stop_trigger","base_size","dev_bps","rr","ts","hold_minutes"]
-
-def _make_ticket(product_id: str, side: str, entry: Decimal, tp: Decimal, sl: Decimal,
-                 base_size: Decimal, hold_minutes: int) -> Dict[str, Any]:
+def _paths(out_dir: str):
     return {
-        "product_id": product_id,
-        "side": side,
-        "entry_price": f"{entry:f}",
-        "tp_price": f"{tp:f}",
-        "stop_trigger": f"{sl:f}",
-        "base_size": f"{base_size:f}",
-        "dev_bps": "",
-        "rr": "",
-        "ts": int(time.time()),
-        "hold_minutes": hold_minutes,
+        "screen_latest": os.path.join(out_dir, "screen_latest.csv"),
+        "screen_history": os.path.join(out_dir, "screen_history.csv"),
+        "ticket_latest": os.path.join(out_dir, "trade_tickets_latest.csv"),
+        "ticket_history": os.path.join(out_dir, "trade_tickets_history.csv"),
     }
 
-def main():
-    # Diagnostics header with the active “gate”
-    gate_req = ENTRY_BPS + SAFETY_BPS + SLIPPAGE_BPS + TAKER_BPS
-    print(f"[stables] Active gate: Δ*={(SAFETY_BPS+SLIPPAGE_BPS):.3f} bps; require |Δ| ≥ {gate_req:.3f} bps  "
-          f"(entry={ENTRY_BPS} safety={SAFETY_BPS} slip={SLIPPAGE_BPS} taker={TAKER_BPS})")
+def main_forever():
+    cfg = _build_cfg()
+    paths = _paths(cfg.out_dir)
 
-    rows_diag, ticket_rows = [], []
-    for pid in UNIVERSE:
-        bid, ask = _best_bid_ask(pid)
-        if not (bid and ask):
-            continue
+    # Headers
+    screen_header = [
+        "ts","product_id","side","entry_price","tp_price","sl_price","base_size",
+        "dev_bps","rr","hold_minutes","reason","risk_dollars","notional","gate_bps","depth_note"
+    ]
+    ticket_header = [
+        "ts","product_id","side","entry_price","tp_price","sl_price","base_size",
+        "post_only","bracket_desired","hold_minutes","reason","risk_dollars"
+    ]
+    ticket_none_header = ["ts","product_id","side","reason"]
 
-        # deviation from $1.0000 (for stable-stable)
-        dev_bps = abs((ask - Decimal("1")) / Decimal("1")) * Decimal(10_000)
-        should_sell = ask > Decimal("1") + _bps_to_frac(ENTRY_BPS)
-        should_buy  = bid < Decimal("1") - _bps_to_frac(ENTRY_BPS)
+    print(f"[stables] Starting scanner loop every {SCAN_INTERVAL_SECS}s. Ctrl+C to stop.")
+    while True:
+        cycle_start = time.time()
+        try:
+            balances = _get_balances()
+            ticket, diag = scan_once(cfg, balances)
 
-        # We’ll only signal one side per cycle; prefer whichever actually passes balance caps.
-        sides = []
-        if should_sell: sides.append("SELL")
-        if should_buy:  sides.append("BUY")
+            # Always write latest diagnostics
+            _write_csv(paths["screen_latest"], [diag], screen_header)
+            _append_csv(paths["screen_history"], diag, screen_header)
 
-        for side in sides:
-            # maker entry at top of book on the correct side
-            entry = ask if side == "SELL" else bid
-            tp = entry * (Decimal("1") - _bps_to_frac(EXIT_BPS)) if side == "SELL" else entry * (Decimal("1") + _bps_to_frac(EXIT_BPS))
-            # “sl” is informational in limit-only flow (we use time-based cancel)
-            sl = entry * (Decimal("1") + _bps_to_frac(3)) if side == "SELL" else entry * (Decimal("1") - _bps_to_frac(3))
+            if ticket:
+                trow = {
+                    "ts": int(time.time()),
+                    "product_id": ticket.product_id,
+                    "side": ticket.side,
+                    "entry_price": ticket.entry_price,
+                    "tp_price": ticket.tp_price,
+                    "sl_price": ticket.sl_price,
+                    "base_size": ticket.base_size,
+                    "post_only": ticket.post_only,
+                    "bracket_desired": ticket.bracket_desired,
+                    "hold_minutes": ticket.hold_minutes,
+                    "reason": ticket.reason,
+                    "risk_dollars": ticket.risk_dollars,
+                }
+                _write_csv(paths["ticket_latest"], [trow], ticket_header)
+                _append_csv(paths["ticket_history"], trow, ticket_header)
+                print(f"[stables] Ticket created: {ticket.product_id} {ticket.side} size={ticket.base_size} "
+                      f"entry={ticket.entry_price} tp={ticket.tp_price} sl={ticket.sl_price} "
+                      f"dev={ticket.dev_bps}bps rr={ticket.rr}")
+            else:
+                none_row = {
+                    "ts": int(time.time()),
+                    "product_id": diag.get("product_id", "USDT-USDC"),
+                    "side": "NONE",
+                    "reason": diag.get("reason", "no_signal"),
+                }
+                _write_csv(paths["ticket_latest"], [none_row], ticket_none_header)
+                _append_csv(paths["ticket_history"], none_row, ticket_none_header)
+                print(f"[stables] No candidate: {none_row['reason']}")
 
-            # bankroll-aware notional (compounds as bankroll grows)
-            target_notional = _target_notional_from_bankroll()
-            desired_base = (target_notional / entry) if entry > 0 else Decimal("0")
-
-            # cap by balances so we never over-size
-            base_capped = _cap_by_balance(pid, side, desired_base, entry)
-
-            # round to increments and ensure min size
-            base_inc, quote_inc, min_size = _product_specs(pid)
-            base_final = round_size(base_capped, base_inc, mode="down")
-            if base_final < min_size:
-                # if SELL cap made it too small, try the other side this cycle
-                continue
-
-            entry = round_price(entry, quote_inc, mode="nearest")
-            tp    = round_price(tp,    quote_inc, mode="nearest")
-            sl    = round_price(sl,    quote_inc, mode="nearest")
-
-            rr = (entry - tp) / (sl - entry) if side == "SELL" and sl > entry else \
-                 (tp - entry) / (entry - sl) if side == "BUY"  and sl < entry else Decimal("0")
-
-            row = {
-                "product_id": pid,
-                "side": side,
-                "entry_price": f"{entry:f}",
-                "tp_price": f"{tp:f}",
-                "stop_trigger": f"{sl:f}",
-                "base_size": f"{base_final:f}",
-                "dev_bps": f"{dev_bps:.2f}",
-                "rr": f"{rr:.2f}",
-                "ts": int(time.time()),
-                "hold_minutes": HOLD_MINUTES,
-            }
-            rows_diag.append(row)
-            ticket_rows.append(_make_ticket(pid, side, entry, tp, sl, base_final, HOLD_MINUTES))
-            # only one ticket per cycle to keep it simple & consistent
+        except KeyboardInterrupt:
+            print("\n[stables] Stopping scanner loop (KeyboardInterrupt).")
             break
+        except Exception as e:
+            # Log the error and keep going next cycle
+            err_row = {
+                "ts": int(time.time()),
+                "product_id": "NA",
+                "side": "NONE",
+                "reason": f"scanner_exception {type(e).__name__}: {e}",
+            }
+            _write_csv(paths["ticket_latest"], [err_row], ["ts","product_id","side","reason"])
+            _append_csv(paths["ticket_history"], err_row, ["ts","product_id","side","reason"])
+            print(f"[stables] ERROR in scan loop: {e}")
 
-    # write outputs
-    diag_fields = _diag_header()
-    _write_csv(OUTPUT_DIR / "screen_latest.csv", diag_fields, rows_diag)
-    if ticket_rows:
-        _write_csv(OUTPUT_DIR / "trade_tickets_latest.csv", diag_fields, ticket_rows)
-        r = rows_diag[0]
-        print("[stables] Candidate:", r["product_id"], r["side"],
-              "entry=", r["entry_price"], "tp=", r["tp_price"],
-              "sl=", r["stop_trigger"], "size=", r["base_size"],
-              "dev_bps=", r["dev_bps"], "RR=", r["rr"])
-        print("[stables] Files written to output_stables")
-    else:
-        # if nothing, clear stale ticket
-        t = OUTPUT_DIR / "trade_tickets_latest.csv"
-        if t.exists():
-            try: t.unlink()
-            except Exception: pass
-        print("[stables] No candidate")
+        # Sleep the remainder of the interval
+        elapsed = time.time() - cycle_start
+        sleep_for = max(0.0, SCAN_INTERVAL_SECS - elapsed)
+        time.sleep(sleep_for)
 
 if __name__ == "__main__":
-    main()
+    main_forever()
