@@ -1,50 +1,37 @@
+# broker/coinbase_public.py
 from __future__ import annotations
-"""
-Lightweight Coinbase Advanced public helpers for OWCG.
 
-Exposes:
-- get_products() -> list[dict] with normalized fields your screener expects
-- get_best_bid_ask(product_id) -> (Decimal bid, Decimal ask)
-
-Robust fetch strategy:
-  1) Prefer Coinbase Advanced REST SDK with explicit timeouts
-  2) Fallbacks for discovery and quotes use public HTTP with timeouts:
-     - Products: Brokerage public endpoint
-     - Quotes:   Exchange public order book (unauthenticated) to avoid 401
-
-Notes:
-- ALWAYS convert SDK response objects via .to_dict() before dict-style access.
-- Normalize fields so downstream code can rely on:
-    product_id, base_currency, quote_currency, base_increment, quote_increment,
-    price_increment, min_order (best-effort), fx_stablecoin (heuristic if missing)
-- Stable-universe inference includes all common stables including USDT, and
-  restricts to stable–USD and stable–stable pairs (excludes alt/stable).
-"""
-
-import os
 from decimal import Decimal
 from typing import Any, Dict, List, Tuple
+import os
 
-# Optional public HTTP fallback
+# --- Load .env early (non-fatal if missing) ---
+try:
+    from dotenv import load_dotenv, find_dotenv  # type: ignore
+    load_dotenv(find_dotenv(), override=False)
+except Exception:
+    pass
+
+# Optional requests fallback for public HTTP
 try:
     import requests  # type: ignore
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
+except Exception:
+    requests = None  # pragma: no cover
 
-# ---- configuration ----
+try:
+    from coinbase.rest import RESTClient
+except Exception:
+    RESTClient = None  # public HTTP fallback will be used
 
-# Default timeouts (seconds). Override via env if desired.
-SDK_TIMEOUT = float(os.getenv("CB_SDK_TIMEOUT", "10"))
-HTTP_TIMEOUT = float(os.getenv("CB_HTTP_TIMEOUT", "10"))
+HTTP_TIMEOUT = float(os.getenv("COINBASE_HTTP_TIMEOUT", "8"))
 
-# Set of stables we consider for the stable-pairs universe
-_STABLES = {"USD", "USDC", "USDT", "DAI", "PYUSD", "TUSD", "USDD", "USDP"}
-
-
-# ---- helpers ----
+def _dec(x: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return Decimal(default)
 
 def _to_dict(obj: Any) -> Any:
-    """Convert SDK response objects to dict when possible."""
     if hasattr(obj, "to_dict"):
         try:
             return obj.to_dict()
@@ -57,195 +44,130 @@ def _to_dict(obj: Any) -> Any:
             pass
     return obj
 
-
-def _dec(x: Any, default: str = "0") -> Decimal:
-    if x is None:
-        return Decimal(default)
+def _client() -> RESTClient | None:
+    if RESTClient is None:
+        return None
     try:
-        return Decimal(str(x))
+        return RESTClient()
     except Exception:
-        return Decimal(default)
-
-
-def _infer_fx_stablecoin(base: str, quote: str) -> bool:
-    """
-    Tight inference for the 'stable pairs' universe used by this strategy:
-    - Include stable–USD (e.g., USDT-USD, DAI-USD)
-    - Include stable–stable (e.g., USDT-USDC, DAI-USDC)
-    - Exclude alt/stable like ROSE-USDT or BTC-USDC
-    """
-    base_is_stable = base in _STABLES
-    quote_is_stable = quote in _STABLES
-    # stable–USD or stable–stable, but not alt/stable
-    return base_is_stable and (quote == "USD" or quote_is_stable)
-
-
-# ---- public API ----
+        return None
 
 def get_products() -> List[Dict[str, Any]]:
-    """
-    Return a normalized list of products with fields our code expects:
-      product_id, base_currency, quote_currency,
-      base_increment, quote_increment, price_increment,
-      min_order (best-effort), fx_stablecoin (bool)
+    """Return a list of products with normalized fields used by our strategies."""
+    # 1) Try SDK
+    cl = _client()
+    if cl is not None:
+        try:
+            resp = cl.get("/api/v3/brokerage/products")
+            data = _to_dict(resp)
+            raw = data.get("products") if isinstance(data, dict) else data
+            products: List[Dict[str, Any]] = []
+            if isinstance(raw, list):
+                for p in raw:
+                    p = _to_dict(p)
+                    pid = p.get("product_id") or p.get("id")
+                    base = p.get("base_currency_id") or p.get("base_currency") or ""
+                    quote = p.get("quote_currency_id") or p.get("quote_currency") or ""
+                    products.append({
+                        "product_id": pid,
+                        "base_currency": base,
+                        "quote_currency": quote,
+                        "base_increment": _dec(p.get("base_increment"), "0.00000001"),
+                        "quote_increment": _dec(p.get("quote_increment"), "0.0001"),
+                        "price_increment": _dec(p.get("price_increment"), "0.0001"),
+                        "min_market_funds": _dec(p.get("min_market_funds"), "0"),
+                        "base_min_size": _dec(p.get("base_min_size"), "0"),
+                    })
+                return products
+        except Exception:
+            pass
 
-    Tries SDK then public HTTP. All calls use explicit timeouts.
-    """
-    products: List[Dict[str, Any]] = []
-
-    # 1) Try SDK (no auth required for public methods, but allow creds if present)
-    try:
-        from coinbase.rest import RESTClient  # coinbase-advanced-py
-        client = RESTClient(
-            api_key=os.getenv("COINBASE_API_KEY"),
-            api_secret=os.getenv("COINBASE_API_SECRET"),
-            timeout=SDK_TIMEOUT,  # explicit timeout to avoid hangs
-        )
-        resp = client.get_products()
-        data = _to_dict(resp)
-
-        raw_list = (
-            data.get("products")
-            if isinstance(data, dict)
-            else (data or [])
-        )
-
-        for p in raw_list:
-            p = _to_dict(p)
-            pid = p.get("product_id") or p.get("id")
-            if not pid:
-                continue
-            base = p.get("base_currency_id") or p.get("base_currency") or ""
-            quote = p.get("quote_currency_id") or p.get("quote_currency") or ""
-            products.append({
-                "product_id": pid,
-                "base_currency": base,
-                "quote_currency": quote,
-                "base_increment": _dec(p.get("base_increment"), "0.00000001"),
-                "quote_increment": _dec(p.get("quote_increment"), "0.0001"),
-                "price_increment": _dec(p.get("price_increment"), "0.0001"),
-                "min_order": _dec(
-                    p.get("base_min_size") or p.get("min_market_order_size") or p.get("min_order_size"),
-                    "0"
-                ),
-                "fx_stablecoin": bool(p.get("fx_stablecoin", _infer_fx_stablecoin(base, quote))),
-            })
-        if products:
-            return products
-    except Exception:
-        # Fall through to HTTP
-        pass
-
-    # 2) Public HTTP fallback for discovery
+    # 2) Public HTTP fallback
     if requests is None:
-        return products  # empty fallback
-
-    try:
-        url = "https://api.coinbase.com/api/v3/brokerage/products?limit=250"
-        r = requests.get(url, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        raw_list = data.get("products", [])
-        for p in raw_list:
-            pid = p.get("product_id")
-            if not pid:
-                continue
-            base = p.get("base_currency_id") or p.get("base_currency") or ""
-            quote = p.get("quote_currency_id") or p.get("quote_currency") or ""
+        raise RuntimeError("Neither SDK nor requests available for get_products().")
+    r = requests.get("https://api.exchange.coinbase.com/products", timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    raw = r.json()
+    products: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for p in raw:
+            pid = p.get("id")
+            base = p.get("base_currency") or ""
+            quote = p.get("quote_currency") or ""
             products.append({
                 "product_id": pid,
                 "base_currency": base,
                 "quote_currency": quote,
                 "base_increment": _dec(p.get("base_increment"), "0.00000001"),
                 "quote_increment": _dec(p.get("quote_increment"), "0.0001"),
-                "price_increment": _dec(p.get("price_increment"), "0.0001"),
-                "min_order": _dec(
-                    p.get("base_min_size") or p.get("min_market_order_size") or p.get("min_order_size"),
-                    "0"
-                ),
-                "fx_stablecoin": bool(p.get("fx_stablecoin", _infer_fx_stablecoin(base, quote))),
+                "price_increment": _dec(p.get("quote_increment"), "0.0001"),
+                "min_market_funds": _dec(p.get("min_market_funds"), "0"),
+                "base_min_size": _dec(p.get("base_min_size"), "0"),
             })
-    except Exception:
-        return products
-
     return products
 
+def get_product(product_id: str) -> Dict[str, Any]:
+    """Return a single product dict with normalized fields."""
+    cl = _client()
+    if cl is not None:
+        try:
+            resp = cl.get(f"/api/v3/brokerage/products/{product_id}")
+            p = _to_dict(resp)
+            if isinstance(p, dict) and "product" in p:
+                p = p["product"]
+            p = _to_dict(p)
+            base = p.get("base_currency_id") or p.get("base_currency") or ""
+            quote = p.get("quote_currency_id") or p.get("quote_currency") or ""
+            return {
+                "product_id": p.get("product_id") or p.get("id") or product_id,
+                "base_currency": base,
+                "quote_currency": quote,
+                "base_increment": _dec(p.get("base_increment"), "0.00000001"),
+                "quote_increment": _dec(p.get("quote_increment"), "0.0001"),
+                "price_increment": _dec(p.get("price_increment"), "0.0001"),
+                "min_market_funds": _dec(p.get("min_market_funds"), "0"),
+                "base_min_size": _dec(p.get("base_min_size"), "0"),
+                "min_size": _dec(p.get("min_order_size"), "0"),
+            }
+        except Exception:
+            pass
+
+    for p in get_products():
+        if p.get("product_id") == product_id:
+            return p
+    raise RuntimeError(f"Unknown product_id {product_id}")
 
 def get_best_bid_ask(product_id: str) -> Tuple[Decimal, Decimal]:
-    """
-    Return (best_bid, best_ask) as Decimals.
+    """Return (bid, ask) as Decimals."""
+    cl = _client()
+    if cl is not None:
+        try:
+            resp = cl.get(f"/api/v3/brokerage/products/{product_id}/book?level=1")
+            d = _to_dict(resp)
+            bids = d.get("bids", [])
+            asks = d.get("asks", [])
+            def _first(x):
+                if not x: return Decimal("0")
+                f = x[0]
+                if isinstance(f, (list, tuple)):
+                    return _dec(f[0], "0")
+                if isinstance(f, dict):
+                    return _dec(f.get("price"), "0")
+                return _dec(f, "0")
+            bid = _first(bids); ask = _first(asks)
+            if bid > 0 and ask > 0:
+                return bid, ask
+        except Exception:
+            pass
 
-    Try SDK first (convert to dict), then public HTTP fallback to Exchange
-    (unauthenticated) to avoid 401 on Brokerage endpoints.
-    Handles bids/asks like:
-      - list of dicts {"price": "...", "size": "..."}
-      - list of lists ["123.45","0.10", ...]
-    """
-    # 1) SDK
-    try:
-        from coinbase.rest import RESTClient  # coinbase-advanced-py
-        client = RESTClient(
-            api_key=os.getenv("COINBASE_API_KEY"),
-            api_secret=os.getenv("COINBASE_API_SECRET"),
-            timeout=SDK_TIMEOUT,  # explicit timeout
-        )
-        resp = client.get_product_book(product_id=product_id, limit=1)
-        data = _to_dict(resp)
-
-        # Some SDKs put bids/asks under "pricebook"
-        book = data.get("pricebook") if isinstance(data, dict) else None
-        if not book and isinstance(data, dict):
-            book = data  # bids/asks might be top-level
-
-        bids = (book or {}).get("bids", []) if isinstance(book, dict) else []
-        asks = (book or {}).get("asks", []) if isinstance(book, dict) else []
-
-        def _first_price(side: List[Any]) -> Decimal:
-            if not side:
-                return Decimal("0")
-            first = side[0]
-            if isinstance(first, dict):
-                return _dec(first.get("price"), "0")
-            if isinstance(first, (list, tuple)) and first:
-                return _dec(first[0], "0")
-            return _dec(first, "0")
-
-        bid = _first_price(bids)
-        ask = _first_price(asks)
-        if bid <= 0 or ask <= 0:
-            raise ValueError(f"Invalid quotes for {product_id}: bid={bid}, ask={ask}")
-        return bid, ask
-    except Exception:
-        pass
-
-    # 2) Public HTTP fallback to Exchange (unauthenticated, reliable)
     if requests is None:
-        raise RuntimeError("No SDK and no requests available for get_best_bid_ask().")
-
-    try:
-        url = f"https://api.exchange.coinbase.com/products/{product_id}/book?level=1"
-        r = requests.get(url, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-
-        bids = data.get("bids", []) if isinstance(data, dict) else []
-        asks = data.get("asks", []) if isinstance(data, dict) else []
-
-        def _first_price(side: List[Any]) -> Decimal:
-            if not side:
-                return Decimal("0")
-            first = side[0]
-            # Exchange book returns list-of-lists: [price, size, num-orders]
-            if isinstance(first, (list, tuple)) and first:
-                return _dec(first[0], "0")
-            if isinstance(first, dict):
-                return _dec(first.get("price"), "0")
-            return _dec(first, "0")
-
-        bid = _first_price(bids)
-        ask = _first_price(asks)
-        if bid <= 0 or ask <= 0:
-            raise ValueError(f"Invalid quotes for {product_id}: bid={bid}, ask={ask}")
-        return bid, ask
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch best bid/ask for {product_id}: {e}")
+        raise RuntimeError("No HTTP client available to fetch orderbook.")
+    r = requests.get(f"https://api.exchange.coinbase.com/products/{product_id}/book?level=1", timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    d = r.json()
+    bids = d.get("bids", []); asks = d.get("asks", [])
+    bid = _dec(bids[0][0], "0") if bids and isinstance(bids[0], (list, tuple)) else _dec(0)
+    ask = _dec(asks[0][0], "0") if asks and isinstance(asks[0], (list, tuple)) else _dec(0)
+    if bid <= 0 or ask <= 0:
+        raise RuntimeError(f"Invalid L1 for {product_id}: {bid}/{ask}")
+    return bid, ask

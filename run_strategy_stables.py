@@ -1,166 +1,173 @@
 # run_strategy_stables.py
 from __future__ import annotations
 
-import csv
 import os
 import time
+import csv
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
 
-from strategies.stables_mean_reversion import StrategyConfig, scan_once
+# Load .env early so API keys are present (non-fatal if missing)
+try:
+    from dotenv import load_dotenv, find_dotenv  # type: ignore
+    load_dotenv(find_dotenv(), override=False)
+except Exception:
+    pass
 
-# ---------------- Config ---------------- #
-SCAN_INTERVAL_SECS = int(os.getenv("OWCG_SCAN_INTERVAL", "15"))  # run every 15s by default
+# --- Strategy import (uses your existing algo) ---
+from strategies.stables_mean_reversion import scan_once  # type: ignore
 
-# ---------------- Balance source (ADAPT ME to your broker) ---------------- #
-def _get_balances() -> Dict[str, Decimal]:
+# -------- Config (env-overridable) --------
+INTERVAL_SECS = int(os.getenv("OWCG_STRAT_INTERVAL", "15"))  # scan every N seconds
+
+# Default output directory for strategy artifacts/logs expected by the strategy
+DEFAULT_OUTDIR = os.getenv("OWCG_STRAT_OUTDIR", os.path.join("out", "stables"))
+# Put CSV inside that folder by default (overridable)
+CSV_PATH = os.getenv("OWCG_STRAT_CSV", os.path.join(DEFAULT_OUTDIR, "stables_scans.csv"))
+
+# Verbose console heartbeat
+VERBOSE = os.getenv("OWCG_STRAT_VERBOSE", "1").lower() in ("1", "true", "yes", "y")
+
+# Some commonly-used knobs the strategy may read
+USE_TAKER = os.getenv("OWCG_USE_TAKER", "true").lower() in ("1", "true", "yes", "y")
+MIN_ACTION_USD = Decimal(os.getenv("OWCG_MIN_ACTION_USD", "1.00"))
+
+# -------- Config wrapper that supports attribute access --------
+class Cfg(dict):
+    """Dict with attribute access; missing attrs return None."""
+    def __getattr__(self, name: str):
+        try:
+            return self[name]
+        except KeyError:
+            return None
+    def __setattr__(self, name: str, value: Any):
+        self[name] = value
+    def get(self, name: str, default=None):  # for safety if strategy calls cfg.get(...)
+        return super().get(name, default)
+
+def _ensure_outdir(path: str) -> str:
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+    return path
+
+def _build_cfg() -> Cfg:
     """
-    Returns a dict like {"USD": Decimal(...), "USDT": Decimal(...), "USDC": Decimal(...)}.
-    Maps to your coinbase_private.get_balances() if available; otherwise uses a safe fallback.
+    Build a config object with the attributes the strategy commonly expects.
+    If the strategy references more attributes later, add them here (or they’ll
+    resolve to None, which most code treats as “use defaults”).
     """
-    try:
+    out_dir = _ensure_outdir(DEFAULT_OUTDIR)
+    cfg = Cfg(
+        out_dir=out_dir,            # <- strategy expects this to exist
+        use_taker=USE_TAKER,        # common flag algos read
+        min_action_usd=MIN_ACTION_USD,
+        interval_secs=INTERVAL_SECS # handy for logs
+    )
+    return cfg
+
+# --- Public/Private adapters (use your existing broker wrappers) ---
+class Priv:
+    @staticmethod
+    def get_balances() -> List[Dict[str, Any]]:
         from broker import coinbase_private as priv
-        bals = priv.get_balances()  # expect [{"currency":"USD","available":"123.45"}, ...]
-        out: Dict[str, Decimal] = {}
-        for b in bals:
-            # pick "available" if present; else "balance"
-            amt = b.get("available", b.get("balance", "0"))
-            out[b["currency"]] = Decimal(str(amt))
-        return out
-    except Exception:
-        # Fallback dummy balances (so the loop doesn't crash in dev)
-        return {"USD": Decimal("1000"), "USDT": Decimal("0"), "USDC": Decimal("0")}
+        return priv.get_balances()
 
-# ---------------- CSV helpers ---------------- #
-def _ensure_dir(path: str):
-    d = os.path.dirname(path)
-    if d:
+# -------- Helpers --------
+def _balances_map() -> Dict[str, Decimal]:
+    out: Dict[str, Decimal] = {}
+    for b in Priv.get_balances():
+        cur = str(b.get("currency", "")).upper()
+        if not cur:
+            continue
+        amt = b.get("available", b.get("balance", "0"))
+        out[cur] = Decimal(str(amt))
+    return out
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _clean_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert non-serializable types (Decimal, lists, dicts) to strings for CSV."""
+    cleaned: Dict[str, Any] = {}
+    for k, v in row.items():
+        if isinstance(v, (Decimal, list, dict, tuple)):
+            cleaned[k] = str(v)
+        else:
+            cleaned[k] = v
+    return cleaned
+
+def _safe_writerow(csv_path: str, row: Dict[str, Any]) -> None:
+    """
+    Write a dict row to CSV without crashing if new keys appear.
+    Uses extrasaction='ignore' so unexpected keys are silently skipped.
+    """
+    # Ensure directory exists if user set a nested path
+    d = os.path.dirname(csv_path)
+    if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
-def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in row.items()}
-
-def _write_csv(path: str, rows: List[Dict[str, Any]], header: List[str]):
-    _ensure_dir(path)
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        w.writeheader()
-        for r in rows:
-            w.writerow(_normalize_row(r))
-
-def _append_csv(path: str, row: Dict[str, Any], header: List[str]):
-    _ensure_dir(path)
-    new_file = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        if new_file:
+    file_exists = os.path.exists(csv_path)
+    baseline_fields = [
+        "ts", "signal", "product_id", "side", "price", "size",
+        "score", "zscore", "spread", "vol", "note", "status",
+    ]
+    mode = "a" if file_exists else "w"
+    with open(csv_path, mode, newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=baseline_fields, extrasaction="ignore")
+        if not file_exists:
             w.writeheader()
-        w.writerow(_normalize_row(row))
+        w.writerow(_clean_row(row))
 
-# ---------------- Main loop ---------------- #
-def _build_cfg() -> StrategyConfig:
-    # Thin-margin defaults; adjust as you learn live performance.
-    return StrategyConfig(
-        products=["USDT-USDC"],         # focus on the tightest stable pair
-        exit_bps=Decimal("0.6"),
-        sl_bps=Decimal("3.0"),
-        slippage_bps=Decimal("0.2"),
-        maker_fee_bps=Decimal("0.0"),
-        taker_fee_bps=Decimal("0.0"),
-        cushion_bps=Decimal("0.2"),
-        hold_minutes=180,
-        depth_ticks=2,
-        min_depth_multiplier=Decimal("1.10"),
-        bankroll_pct=Decimal("0.10"),   # 10% bankroll target
-        min_notional=Decimal("50"),
-        max_notional=Decimal("500"),
-        out_dir="output_stables",
-    )
+def _print_heartbeat(diag: Optional[Dict[str, Any]], err: Optional[str] = None):
+    if not VERBOSE:
+        return
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if err:
+        print(f"[stables] {now} ERROR: {err}")
+        return
+    if not diag:
+        print(f"[stables] {now} tick (no diag)")
+        return
+    sig = diag.get("signal") or diag.get("note") or "ok"
+    pid = diag.get("product_id") or ""
+    st  = diag.get("status") or ""
+    print(f"[stables] {now} tick | {sig} {pid} {st}".strip())
 
-def _paths(out_dir: str):
-    return {
-        "screen_latest": os.path.join(out_dir, "screen_latest.csv"),
-        "screen_history": os.path.join(out_dir, "screen_history.csv"),
-        "ticket_latest": os.path.join(out_dir, "trade_tickets_latest.csv"),
-        "ticket_history": os.path.join(out_dir, "trade_tickets_history.csv"),
-    }
-
-def main_forever():
+# -------- Main loop --------
+def main():
     cfg = _build_cfg()
-    paths = _paths(cfg.out_dir)
-
-    # Headers
-    screen_header = [
-        "ts","product_id","side","entry_price","tp_price","sl_price","base_size",
-        "dev_bps","rr","hold_minutes","reason","risk_dollars","notional","gate_bps","depth_note"
-    ]
-    ticket_header = [
-        "ts","product_id","side","entry_price","tp_price","sl_price","base_size",
-        "post_only","bracket_desired","hold_minutes","reason","risk_dollars"
-    ]
-    ticket_none_header = ["ts","product_id","side","reason"]
-
-    print(f"[stables] Starting scanner loop every {SCAN_INTERVAL_SECS}s. Ctrl+C to stop.")
+    print(f"[stables] Writing artifacts to: {cfg.out_dir}")
+    print(f"[stables] CSV log: {CSV_PATH}")
+    print(f"[stables] Starting scanner loop every {INTERVAL_SECS}s. Ctrl+C to stop.")
     while True:
-        cycle_start = time.time()
         try:
-            balances = _get_balances()
+            balances = _balances_map()
+            # Execute one scan step with a config that has attribute access
             ticket, diag = scan_once(cfg, balances)
 
-            # Always write latest diagnostics
-            _write_csv(paths["screen_latest"], [diag], screen_header)
-            _append_csv(paths["screen_history"], diag, screen_header)
+            # Ensure we always have something loggable
+            if not isinstance(diag, dict):
+                diag = {"note": str(diag)}
 
-            if ticket:
-                trow = {
-                    "ts": int(time.time()),
-                    "product_id": ticket.product_id,
-                    "side": ticket.side,
-                    "entry_price": ticket.entry_price,
-                    "tp_price": ticket.tp_price,
-                    "sl_price": ticket.sl_price,
-                    "base_size": ticket.base_size,
-                    "post_only": ticket.post_only,
-                    "bracket_desired": ticket.bracket_desired,
-                    "hold_minutes": ticket.hold_minutes,
-                    "reason": ticket.reason,
-                    "risk_dollars": ticket.risk_dollars,
-                }
-                _write_csv(paths["ticket_latest"], [trow], ticket_header)
-                _append_csv(paths["ticket_history"], trow, ticket_header)
-                print(f"[stables] Ticket created: {ticket.product_id} {ticket.side} size={ticket.base_size} "
-                      f"entry={ticket.entry_price} tp={ticket.tp_price} sl={ticket.sl_price} "
-                      f"dev={ticket.dev_bps}bps rr={ticket.rr}")
-            else:
-                none_row = {
-                    "ts": int(time.time()),
-                    "product_id": diag.get("product_id", "USDT-USDC"),
-                    "side": "NONE",
-                    "reason": diag.get("reason", "no_signal"),
-                }
-                _write_csv(paths["ticket_latest"], [none_row], ticket_none_header)
-                _append_csv(paths["ticket_history"], none_row, ticket_none_header)
-                print(f"[stables] No candidate: {none_row['reason']}")
+            # Add timestamp and persist
+            row = {"ts": _ts(), **diag}
+            _safe_writerow(CSV_PATH, row)
+
+            _print_heartbeat(diag)
 
         except KeyboardInterrupt:
-            print("\n[stables] Stopping scanner loop (KeyboardInterrupt).")
+            print("[stables] Stopping.")
             break
         except Exception as e:
-            # Log the error and keep going next cycle
-            err_row = {
-                "ts": int(time.time()),
-                "product_id": "NA",
-                "side": "NONE",
-                "reason": f"scanner_exception {type(e).__name__}: {e}",
-            }
-            _write_csv(paths["ticket_latest"], [err_row], ["ts","product_id","side","reason"])
-            _append_csv(paths["ticket_history"], err_row, ["ts","product_id","side","reason"])
-            print(f"[stables] ERROR in scan loop: {e}")
-
-        # Sleep the remainder of the interval
-        elapsed = time.time() - cycle_start
-        sleep_for = max(0.0, SCAN_INTERVAL_SECS - elapsed)
-        time.sleep(sleep_for)
+            msg = getattr(e, "args", [str(e)])[0] if e else "unknown error"
+            _print_heartbeat(None, err=msg)
+            try:
+                _safe_writerow(CSV_PATH, {"ts": _ts(), "signal": "error", "note": msg})
+            except Exception:
+                pass
+        finally:
+            time.sleep(INTERVAL_SECS)
 
 if __name__ == "__main__":
-    main_forever()
+    main()

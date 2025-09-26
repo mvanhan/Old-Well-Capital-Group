@@ -71,3 +71,11 @@ ts,product_id,side,reason
 1758909356,USDT-USDC,NONE,insufficient_balance
 1758909366,USDT-USDC,NONE,insufficient_balance
 1758909377,USDT-USDC,NONE,insufficient_balance
+1758918391,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918406,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918421,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918436,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918451,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918466,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918481,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
+1758918496,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"
