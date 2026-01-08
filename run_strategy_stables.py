@@ -1,171 +1,129 @@
 # run_strategy_stables.py
 from __future__ import annotations
 
-import os
-import time
-import csv
+import os, time, csv
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
 
-# Load .env early so API keys are present (non-fatal if missing)
+# .env (non-fatal)
 try:
     from dotenv import load_dotenv, find_dotenv  # type: ignore
     load_dotenv(find_dotenv(), override=False)
 except Exception:
     pass
 
-# --- Strategy import (uses your existing algo) ---
-from strategies.stables_mean_reversion import scan_once  # type: ignore
+from strategies.stables_mean_reversion import StrategyConfig, scan_once
 
-# -------- Config (env-overridable) --------
-INTERVAL_SECS = int(os.getenv("OWCG_STRAT_INTERVAL", "15"))  # scan every N seconds
+OUTDIR = "output_stables"
+CSV_SCANS   = os.path.join(OUTDIR, "screen_latest.csv")
+CSV_HISTORY = os.path.join(OUTDIR, "screen_history.csv")
+CSV_TICKET  = os.path.join(OUTDIR, "trade_tickets_latest.csv")
+CSV_TIXHIST = os.path.join(OUTDIR, "trade_tickets_history.csv")
 
-# Default output directory for strategy artifacts/logs expected by the strategy
-DEFAULT_OUTDIR = os.getenv("OWCG_STRAT_OUTDIR", os.path.join("out", "stables"))
-# Put CSV inside that folder by default (overridable)
-CSV_PATH = os.getenv("OWCG_STRAT_CSV", os.path.join(DEFAULT_OUTDIR, "stables_scans.csv"))
+INTERVAL_SECS = int(os.getenv("STABLES_SCAN_INTERVAL", "15"))
 
-# Verbose console heartbeat
-VERBOSE = os.getenv("OWCG_STRAT_VERBOSE", "1").lower() in ("1", "true", "yes", "y")
+# ---- Broker balances (Coinbase Advanced) ----
+def _balances() -> Dict[str, Decimal]:
+    if os.getenv("OWCG_OFFLINE") == "1":
+        return {"USDT": Decimal("1000"), "USDC": Decimal("1000"), "USD": Decimal("1000")}
+    try:
+        from broker import coinbase_private as cb_priv  # type: ignore
+        bals = cb_priv.get_balances()
+        out: Dict[str, Decimal] = {}
+        for b in bals:
+            ccy = b.get("currency") or b.get("asset") or b.get("symbol")
+            avail = b.get("available") or b.get("available_balance") or b.get("available_for_trading")
+            if isinstance(avail, dict):  # SDK returns {"value":"...","currency":"USD"}
+                avail = avail.get("value")
+            if not ccy or avail is None: continue
+            try:
+                out[str(ccy)] = Decimal(str(avail))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return {}
 
-# Some commonly-used knobs the strategy may read
-USE_TAKER = os.getenv("OWCG_USE_TAKER", "true").lower() in ("1", "true", "yes", "y")
-MIN_ACTION_USD = Decimal(os.getenv("OWCG_MIN_ACTION_USD", "1.00"))
+def _ts() -> int: return int(time.time())
 
-# -------- Config wrapper that supports attribute access --------
-class Cfg(dict):
-    """Dict with attribute access; missing attrs return None."""
-    def __getattr__(self, name: str):
-        try:
-            return self[name]
-        except KeyError:
-            return None
-    def __setattr__(self, name: str, value: Any):
-        self[name] = value
-    def get(self, name: str, default=None):  # for safety if strategy calls cfg.get(...)
-        return super().get(name, default)
+def _ts_human(ts: Optional[int] = None) -> str:
+    ts = ts or _ts()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
-def _ensure_outdir(path: str) -> str:
-    if path and not os.path.exists(path):
+def _ensure_outdir(path: str) -> None:
+    if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-    return path
 
-def _build_cfg() -> Cfg:
-    """
-    Build a config object with the attributes the strategy commonly expects.
-    If the strategy references more attributes later, add them here (or they’ll
-    resolve to None, which most code treats as “use defaults”).
-    """
-    out_dir = _ensure_outdir(DEFAULT_OUTDIR)
-    cfg = Cfg(
-        out_dir=out_dir,            # <- strategy expects this to exist
-        use_taker=USE_TAKER,        # common flag algos read
-        min_action_usd=MIN_ACTION_USD,
-        interval_secs=INTERVAL_SECS # handy for logs
-    )
-    return cfg
+def _writerow(path: str, row: Dict[str, Any], header: List[str]) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if not exists: w.writeheader()
+        w.writerow(row)
 
-# --- Public/Private adapters (use your existing broker wrappers) ---
-class Priv:
-    @staticmethod
-    def get_balances() -> List[Dict[str, Any]]:
-        from broker import coinbase_private as priv
-        return priv.get_balances()
+def _scan_header(diag: Dict[str, Any]) -> List[str]:
+    base = ["ts","ts_human","product_id","side","reason"]
+    for k in ("dev_bps","edge_minus_gate_bps","notional","gate_bps","depth_note","risk_dollars"):
+        if k in diag and k not in base: base.append(k)
+    return base
 
-# -------- Helpers --------
-def _balances_map() -> Dict[str, Decimal]:
-    out: Dict[str, Decimal] = {}
-    for b in Priv.get_balances():
-        cur = str(b.get("currency", "")).upper()
-        if not cur:
-            continue
-        amt = b.get("available", b.get("balance", "0"))
-        out[cur] = Decimal(str(amt))
-    return out
+def _ticket_header() -> List[str]:
+    return ["ts","product_id","side","entry_price","size","tp_price","sl_price","post_only","bracket_desired","client_tag","reason"]
 
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def _clean_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert non-serializable types (Decimal, lists, dicts) to strings for CSV."""
-    cleaned: Dict[str, Any] = {}
-    for k, v in row.items():
-        if isinstance(v, (Decimal, list, dict, tuple)):
-            cleaned[k] = str(v)
-        else:
-            cleaned[k] = v
-    return cleaned
-
-def _safe_writerow(csv_path: str, row: Dict[str, Any]) -> None:
-    """
-    Write a dict row to CSV without crashing if new keys appear.
-    Uses extrasaction='ignore' so unexpected keys are silently skipped.
-    """
-    # Ensure directory exists if user set a nested path
-    d = os.path.dirname(csv_path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-    file_exists = os.path.exists(csv_path)
-    baseline_fields = [
-        "ts", "signal", "product_id", "side", "price", "size",
-        "score", "zscore", "spread", "vol", "note", "status",
-    ]
-    mode = "a" if file_exists else "w"
-    with open(csv_path, mode, newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=baseline_fields, extrasaction="ignore")
-        if not file_exists:
-            w.writeheader()
-        w.writerow(_clean_row(row))
-
-def _print_heartbeat(diag: Optional[Dict[str, Any]], err: Optional[str] = None):
-    if not VERBOSE:
-        return
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    if err:
-        print(f"[stables] {now} ERROR: {err}")
-        return
-    if not diag:
-        print(f"[stables] {now} tick (no diag)")
-        return
-    sig = diag.get("signal") or diag.get("note") or "ok"
-    pid = diag.get("product_id") or ""
-    st  = diag.get("status") or ""
-    print(f"[stables] {now} tick | {sig} {pid} {st}".strip())
-
-# -------- Main loop --------
 def main():
-    cfg = _build_cfg()
-    print(f"[stables] Writing artifacts to: {cfg.out_dir}")
-    print(f"[stables] CSV log: {CSV_PATH}")
-    print(f"[stables] Starting scanner loop every {INTERVAL_SECS}s. Ctrl+C to stop.")
+    _ensure_outdir(OUTDIR)
+
+    # DEFAULT CONFIG — Coinbase Advanced stables only
+    cfg = StrategyConfig(
+        products=[
+            "USDT-USD",
+            "USDC-USD",
+            "USDT-USDC",
+        ],
+        out_dir=OUTDIR,
+        maker_fee_bps=Decimal(os.getenv("MAKER_FEE_BPS","0.0")),
+        taker_fee_bps=Decimal(os.getenv("TAKER_FEE_BPS","0.0")),
+        exit_bps=Decimal(os.getenv("EXIT_BPS","4.0")),
+        sl_bps=Decimal(os.getenv("SL_BPS","6.0")),
+        slippage_bps=Decimal(os.getenv("SLIPPAGE_BPS","1.0")),
+        cushion_bps=Decimal(os.getenv("CUSHION_BPS","0.2")),
+        block_on_missing_l2=(os.getenv("BLOCK_ON_MISSING_L2","1") in ("1","true","True")),
+        bankroll_usd=Decimal(os.getenv("BANKROLL_USD","100")),
+        bankroll_pct=Decimal(os.getenv("BANKROLL_PCT","0.10")),
+        min_notional=Decimal(os.getenv("MIN_NOTIONAL","5")),
+        max_notional=Decimal(os.getenv("MAX_NOTIONAL","500")),
+        max_risk_usd=Decimal(os.getenv("MAX_RISK_USD","3")),
+        min_tp_ticks=int(os.getenv("MIN_TP_TICKS","1")),
+        min_sl_ticks=int(os.getenv("MIN_SL_TICKS","1")),
+    )
+
+    print("[stables] Staring scanner loop; Ctrl+C to stop.")
     while True:
         try:
-            balances = _balances_map()
-            # Execute one scan step with a config that has attribute access
-            ticket, diag = scan_once(cfg, balances)
+            bals = _balances()
+            tkt, diag = scan_once(cfg, balances=bals)
 
-            # Ensure we always have something loggable
-            if not isinstance(diag, dict):
-                diag = {"note": str(diag)}
+            # write diag rows
+            diag_row = {"ts": _ts(), "ts_human": _ts_human(), **diag}
+            _writerow(CSV_SCANS, diag_row, _scan_header(diag_row))
+            _writerow(CSV_HISTORY, diag_row, _scan_header(diag_row))
 
-            # Add timestamp and persist
-            row = {"ts": _ts(), **diag}
-            _safe_writerow(CSV_PATH, row)
-
-            _print_heartbeat(diag)
+            if tkt:
+                row = {**tkt.to_row(), "reason":"pass"}
+                _writerow(CSV_TICKET,  row, _ticket_header())
+                _writerow(CSV_TIXHIST, row, _ticket_header())
+                print(f"[stables] signal {tkt.side} {tkt.product_id} sz={tkt.size} @ {tkt.entry_price} tp={tkt.tp_price} sl={tkt.sl_price}")
+            else:
+                print(f"[stables] no-signal: {diag.get('reason')}")
 
         except KeyboardInterrupt:
             print("[stables] Stopping.")
             break
         except Exception as e:
             msg = getattr(e, "args", [str(e)])[0] if e else "unknown error"
-            _print_heartbeat(None, err=msg)
-            try:
-                _safe_writerow(CSV_PATH, {"ts": _ts(), "signal": "error", "note": msg})
-            except Exception:
-                pass
+            print(f"[stables] ERROR: {msg}")
+            # keep running
         finally:
             time.sleep(INTERVAL_SECS)
 

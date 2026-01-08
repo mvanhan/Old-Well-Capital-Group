@@ -1,257 +1,128 @@
 # run_controller_stables.py
 from __future__ import annotations
 
-import csv
-import json
-import os
-import time
-from dataclasses import dataclass
+import os, time, csv, json
+from dataclasses import dataclass, asdict
 from decimal import Decimal
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
-STATE_PATH = "output_stables/state.jsonl"
-TICKET_PATH = "output_stables/trade_tickets_latest.csv"
+STATE_PATH   = "output_stables/state.jsonl"
+TICKET_PATH  = "output_stables/trade_tickets_latest.csv"
+RESERVE_LOG  = "output_stables/reserve_actions.csv"
+POLL_SECS    = int(os.getenv("CONTROLLER_POLL_SECS", "10"))
 
-# -------- Broker interfaces (ADAPT ME to your wrappers) -------- #
-# Map these to your broker.coinbase_* modules once and you're done.
+# Reserve policy
+MIN_USD     = Decimal(os.getenv("RESERVE_MIN_USD",  "50"))
+MIN_USDT    = Decimal(os.getenv("RESERVE_MIN_USDT","50"))
+MIN_USDC    = Decimal(os.getenv("RESERVE_MIN_USDC","50"))
+TOPUP_UNIT  = Decimal(os.getenv("RESERVE_TOPUP_USD","50"))  # per action, in USD notional
 
-class Broker:
-    @staticmethod
-    def place_bracket_limit_post_only(product_id: str, side: str, price: str, size: str, tp: str, sl: str, client_oid: str) -> Dict[str, Any]:
-        """
-        Return {"parent_id": "...", "tp_id": "...", "sl_id": "..."}
-        Raise NotImplementedError if exchange doesn't support bracket post_only.
-        """
-        try:
-            from broker import coinbase_private as priv
-            return priv.place_bracket_limit_post_only(product_id, side, price, size, tp, sl, client_oid)
-        except AttributeError:
-            raise NotImplementedError("bracket_post_only_not_supported")
+# ---- Broker adaptors ----
+from broker import coinbase_private as cb_priv  # type: ignore
+from broker import coinbase_public  as cb_pub   # type: ignore
 
-    @staticmethod
-    def place_limit_post_only(product_id: str, side: str, price: str, size: str, client_oid: str) -> Dict[str, Any]:
-        from broker import coinbase_private as priv
-        return priv.place_limit_post_only(product_id, side, price, size, client_oid)
+def q(x) -> Decimal: return x if isinstance(x, Decimal) else Decimal(str(x))
 
-    @staticmethod
-    def cancel_order(order_id: str) -> None:
-        from broker import coinbase_private as priv
-        priv.cancel_order(order_id)
+def _write_jsonl(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(obj) + "\n")
 
-    @staticmethod
-    def get_order_status(order_id: str) -> Dict[str, Any]:
-        from broker import coinbase_private as priv
-        return priv.get_order_status(order_id)
+def _balances() -> Dict[str, Decimal]:
+    bals = cb_priv.get_balances()
+    out: Dict[str, Decimal] = {}
+    for b in bals:
+        sym = b.get("currency") or b.get("asset") or b.get("symbol")
+        val = b.get("available") or b.get("available_balance") or b.get("available_for_trading")
+        if isinstance(val, dict): val = val.get("value")
+        if not sym or val is None: continue
+        try: out[str(sym)] = Decimal(str(val))
+        except Exception: pass
+    return out
 
-    @staticmethod
-    def get_open_orders(product_id: Optional[str] = None) -> list[Dict[str, Any]]:
-        from broker import coinbase_private as priv
-        return priv.get_open_orders(product_id=product_id) if hasattr(priv, "get_open_orders") else []
+def _reserve_topup_log(row: Dict[str,str]) -> None:
+    exists = os.path.exists(RESERVE_LOG)
+    with open(RESERVE_LOG, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists: w.writeheader()
+        w.writerow(row)
 
-    @staticmethod
-    def place_taker_stop_or_flatten(product_id: str, side: str, stop_price: str, size: str, client_oid: str) -> Dict[str, Any]:
-        """
-        Submit a taker protective order once parent is filled (or flatten at market if needed).
-        """
-        from broker import coinbase_private as priv
-        if hasattr(priv, "place_stop_market"):
-            # side for the stop is opposite the position direction
-            stop_side = "SELL" if side == "BUY" else "BUY"
-            return priv.place_stop_market(product_id, stop_side, stop_price, size, client_oid)
-        elif hasattr(priv, "flatten_market"):
-            return priv.flatten_market(product_id, side, size, client_oid)  # ADAPT: side may be ignored
-        else:
-            # Last resort: market out using opposite side
-            opp = "SELL" if side == "BUY" else "BUY"
-            if hasattr(priv, "place_market"):
-                return priv.place_market(product_id, opp, size, client_oid)
-            raise NotImplementedError("No taker stop/flatten method available.")
+def _post_maker_buy(product_id: str, usd_notional: Decimal) -> Optional[str]:
+    # product like USDT-USD / USDC-USD
+    bid, ask = cb_pub.get_best_bid_ask(product_id)
+    price_inc = q(next((p for p in cb_pub.get_products() if p.get("product_id")==product_id), {}).get("price_increment", "0.0001"))
+    base_inc  = q(next((p for p in cb_pub.get_products() if p.get("product_id")==product_id), {}).get("base_increment", "0.01"))
+    # try paying near bid
+    price = Decimal(str(bid))
+    size  = (usd_notional / price).quantize(base_inc)
+    ok, resp = cb_priv.place_limit_order(product_id, side="BUY", size=str(size), limit_price=str(price), post_only=True, client_order_id=f"reserve-{int(time.time())}")
+    if ok:
+        return resp.get("order_id")
+    return None
 
-class MarketData:
-    @staticmethod
-    def best_bid_ask(product_id: str) -> Dict[str, Decimal]:
-        from broker import coinbase_public as pub
-        q = pub.get_best_bid_ask(product_id)
-        return {"bid": Decimal(q["bid"]), "ask": Decimal(q["ask"])}
-
-# ---------------- Risk / health checks ------------------------- #
-def trading_allowed(product_id: str) -> bool:
-    try:
-        from risk.healthchecks import trading_allowed as ra
-        return ra(product_id)
-    except Exception:
-        return True
-
-# -------------------- Utilities -------------------------------- #
-def _append_state(entry: Dict[str, Any]):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    with open(STATE_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-def _read_ticket(path: str) -> Optional[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        r = list(csv.DictReader(f))
-        return r[0] if r else None
-
-def _now() -> int:
-    return int(time.time())
-
-# -------------------- Controller -------------------------------- #
-@dataclass
-class ControllerConfig:
-    reprice_every_secs: int = 45
-    max_reprices: int = 3
-    watch_sl_interval_secs: int = 2
-    max_hold_seconds: int = 180 * 60  # align with ticket hold_minutes
-    position_cap_per_product: int = 1  # conservative: one active parent per product
-
-def _ready_to_place(product_id: str, cfg: ControllerConfig) -> bool:
-    # Ensure we don't pile up multiple parents
-    opens = Broker.get_open_orders(product_id)
-    parents = [o for o in opens if o.get("product_id") == product_id and o.get("status") in ("OPEN","PENDING")]
-    return len(parents) < cfg.position_cap_per_product
-
-def _place_with_reprice_and_optional_bracket(ticket: Dict[str, Any], cfg: ControllerConfig) -> Dict[str, Any]:
-    """
-    Try bracket+post-only first; if unsupported, place post-only parent and manage reprice/stop ourselves.
-    Returns a dict with placement details.
-    """
-    product_id = ticket["product_id"]
-    side = ticket["side"]
-    price = Decimal(ticket["entry_price"])
-    size = Decimal(ticket["base_size"])
-    tp = Decimal(ticket["tp_price"])
-    sl = Decimal(ticket["sl_price"])
-    client_oid_base = f"stables_{product_id}_{_now()}"
-
-    # Try bracket + post-only
-    bracket_supported = True
-    try:
-        resp = Broker.place_bracket_limit_post_only(
-            product_id, side, str(price), str(size), str(tp), str(sl), client_oid_base+"b"
-        )
-        placement = {
-            "mode": "BRACKET_POST_ONLY",
-            "parent_id": resp.get("parent_id"),
-            "tp_id": resp.get("tp_id"),
-            "sl_id": resp.get("sl_id"),
-            "bracket_supported": True,
-        }
-        _append_state({"ts": _now(), "event": "placed_bracket_postonly", "details": placement})
-        return placement
-    except NotImplementedError:
-        bracket_supported = False
-
-    # Fallback: post-only parent, reprice if stale
-    placement = {"mode": "LIMIT_ONLY", "bracket_supported": False, "parent_id": None}
-    attempts = 0
-
-    while attempts <= cfg.max_reprices:
-        client_oid = client_oid_base + f"r{attempts}"
-        resp = Broker.place_limit_post_only(product_id, side, str(price), str(size), client_oid)
-        parent_id = resp.get("order_id") or resp.get("id")
-        placement["parent_id"] = parent_id
-        _append_state({"ts": _now(), "event": "placed_limit_postonly", "details": {"parent_id": parent_id, "price": str(price), "attempt": attempts}})
-
-        # Wait and check if we are still top-of-book; if not, reprice
-        t0 = time.time()
-        while time.time() - t0 < cfg.reprice_every_secs:
-            status = Broker.get_order_status(parent_id)
-            if status.get("status") in ("FILLED","FILLED_PARTIAL","DONE","MATCHED","CLOSED"):
-                placement["filled"] = True
-                _append_state({"ts": _now(), "event": "parent_filled", "details": {"parent_id": parent_id}})
-                return placement
-            # still open; small sleep to avoid hammering
-            time.sleep(1.0)
-
-        # Reprice if not filled
-        attempts += 1
-        if attempts > cfg.max_reprices:
-            _append_state({"ts": _now(), "event": "max_reprices_reached", "details": {"parent_id": parent_id}})
-            break
-
-        # Cancel and move to new best
-        try:
-            Broker.cancel_order(parent_id)
-            q = MarketData.best_bid_ask(product_id)
-            price = q["bid"] if side == "BUY" else q["ask"]
-            _append_state({"ts": _now(), "event": "repricing", "details": {"new_price": str(price), "attempt": attempts}})
-        except Exception as e:
-            _append_state({"ts": _now(), "event": "repricing_failed", "details": {"error": str(e)}})
-            break
-
-    return placement
-
-def _watch_stop_if_needed(product_id: str, side: str, sl_price: Decimal, size: Decimal, placement: Dict[str, Any], cfg: ControllerConfig):
-    """
-    Only for LIMIT_ONLY mode where we didn't get an on-exchange stop.
-    If parent gets filled, arm a taker stop or flatten when price breaches SL.
-    """
-    if placement.get("mode") != "LIMIT_ONLY":
-        return
-
-    parent_id = placement.get("parent_id")
-    if not parent_id:
-        return
-
-    start = time.time()
-    filled = False
-    while time.time() - start < cfg.max_hold_seconds:
-        st = Broker.get_order_status(parent_id)
-        status = st.get("status", "")
-        if status in ("FILLED","FILLED_PARTIAL","DONE","MATCHED","CLOSED") and not filled:
-            filled = True
-            _append_state({"ts": _now(), "event": "parent_filled_limit_only", "details": {"parent_id": parent_id}})
-        # Price-based stop after fill
-        if filled:
-            q = MarketData.best_bid_ask(product_id)
-            px = q["bid"] if side == "BUY" else q["ask"]
-            breach = (px <= sl_price) if side == "BUY" else (px >= sl_price)
-            if breach:
-                try:
-                    Broker.place_taker_stop_or_flatten(
-                        product_id, side, str(sl_price), str(size), f"stables_stop_{_now()}"
-                    )
-                    _append_state({"ts": _now(), "event": "stop_executed", "details": {"parent_id": parent_id, "sl_price": str(sl_price)}})
-                except Exception as e:
-                    _append_state({"ts": _now(), "event": "stop_failed", "details": {"error": str(e)}})
+def _ensure_reserves(bals: Dict[str, Decimal]) -> None:
+    actions: List[str] = []
+    # maintain USD for BUY legs & top-ups
+    if bals.get("USD", Decimal("0")) < MIN_USD:
+        # attempt to SELL a bit of USDT->USD or USDC->USD to raise USD
+        for base in ("USDT-USD","USDC-USD"):
+            # if we have base > threshold, sell TOPUP_UNIT worth
+            asset = base.split("-")[0]
+            if bals.get(asset, Decimal("0")) > Decimal("1"):
+                bid, ask = cb_pub.get_best_bid_ask(base)
+                price = Decimal(str(bid))
+                size  = (TOPUP_UNIT / price)
+                cb_priv.place_limit_order(base, side="SELL", size=str(size), limit_price=str(price), post_only=True, client_order_id=f"usd-raise-{int(time.time())}")
+                actions.append(f"SELL {asset}->{base.split('-')[1]} {size}@{price}")
                 break
-        time.sleep(cfg.watch_sl_interval_secs)
+
+    # keep USDT supply
+    if bals.get("USDT", Decimal("0")) < MIN_USDT and bals.get("USD", Decimal("0")) >= TOPUP_UNIT:
+        oid = _post_maker_buy("USDT-USD", TOPUP_UNIT)
+        if oid: actions.append(f"BUY USDT-USD ${TOPUP_UNIT} oid={oid}")
+
+    # keep USDC supply
+    if bals.get("USDC", Decimal("0")) < MIN_USDC and bals.get("USD", Decimal("0")) >= TOPUP_UNIT:
+        oid = _post_maker_buy("USDC-USD", TOPUP_UNIT)
+        if oid: actions.append(f"BUY USDC-USD ${TOPUP_UNIT} oid={oid}")
+
+    if actions:
+        _reserve_topup_log({"ts": str(int(time.time())), "actions": " | ".join(actions)})
+
+def _poison_old_tickets() -> None:
+    # optional: truncate the ticket file to avoid resubmitting stale ones in other processes
+    try:
+        with open(TICKET_PATH) as f:
+            rows = list(csv.DictReader(f))
+        if rows:
+            rows[0]["reason"] = "consumed_by_controller"
+            with open(TICKET_PATH, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader(); w.writerow(rows[0])
+    except Exception:
+        pass
 
 def main():
-    cfg = ControllerConfig()
+    print("[controller] running; Ctrl+C to stop.")
+    while True:
+        try:
+            bals = _balances()
+            _ensure_reserves(bals)
 
-    t = _read_ticket(TICKET_PATH)
-    if not t:
-        print("[controller] No ticket file.")
-        return
-    if t.get("side") in (None, "", "NONE"):
-        print(f"[controller] No signal: {t.get('reason','')}")
-        return
+            # Example loop could also check open orders, stale parents, etc.
+            # Keep lightweight and let submitter handle placements.
 
-    product_id = t["product_id"]
-    if not trading_allowed(product_id):
-        print("[controller] Trading paused by risk controls.")
-        return
+            _write_jsonl(STATE_PATH, {"ts": int(time.time()), "balances": {k: str(v) for k,v in bals.items()}})
 
-    if not _ready_to_place(product_id, cfg):
-        print("[controller] Position cap reached; skipping.")
-        return
+            _poison_old_tickets()  # avoid duplicate consumption if you run multiple processes
 
-    placement = _place_with_reprice_and_optional_bracket(t, cfg)
-
-    # If no bracket, we must supervise stop ourselves
-    if placement.get("mode") == "LIMIT_ONLY":
-        _watch_stop_if_needed(
-            product_id=product_id,
-            side=t["side"],
-            sl_price=Decimal(t["sl_price"]),
-            size=Decimal(t["base_size"]),
-            placement=placement,
-            cfg=cfg,
-        )
+        except KeyboardInterrupt:
+            print("[controller] stopping")
+            break
+        except Exception as e:
+            _write_jsonl(STATE_PATH, {"ts": int(time.time()), "error": str(e)})
+        finally:
+            time.sleep(POLL_SECS)
 
 if __name__ == "__main__":
     main()
