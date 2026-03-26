@@ -1,128 +1,239 @@
-# run_controller_stables.py
 from __future__ import annotations
 
-import os, time, csv, json
-from dataclasses import dataclass, asdict
+import csv
+import json
+import os
+import time
 from decimal import Decimal
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
-STATE_PATH   = "output_stables/state.jsonl"
-TICKET_PATH  = "output_stables/trade_tickets_latest.csv"
-RESERVE_LOG  = "output_stables/reserve_actions.csv"
-POLL_SECS    = int(os.getenv("CONTROLLER_POLL_SECS", "10"))
-
-# Reserve policy
-MIN_USD     = Decimal(os.getenv("RESERVE_MIN_USD",  "50"))
-MIN_USDT    = Decimal(os.getenv("RESERVE_MIN_USDT","50"))
-MIN_USDC    = Decimal(os.getenv("RESERVE_MIN_USDC","50"))
-TOPUP_UNIT  = Decimal(os.getenv("RESERVE_TOPUP_USD","50"))  # per action, in USD notional
-
-# ---- Broker adaptors ----
 from broker import coinbase_private as cb_priv  # type: ignore
-from broker import coinbase_public  as cb_pub   # type: ignore
+from broker import coinbase_public as cb_pub  # type: ignore
+from owcg_utils.precision import round_price, round_size
 
-def q(x) -> Decimal: return x if isinstance(x, Decimal) else Decimal(str(x))
+OUTDIR = "output_stables"
+STATE_PATH = os.path.join(OUTDIR, "state.jsonl")
+RESERVE_LOG = os.path.join(OUTDIR, "reserve_actions.csv")
+SUBMITTER_STATE_PATH = os.path.join(OUTDIR, "submitter_state.json")
+POLL_SECS = int(os.getenv("CONTROLLER_POLL_SECS", "10"))
+RESERVE_ORDER_PREFIX = os.getenv("RESERVE_ORDER_PREFIX", "reserve-")
+
+
+def q(x: Any) -> Decimal:
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
+def _ensure_outdir() -> None:
+    os.makedirs(OUTDIR, exist_ok=True)
+
+
+def _products() -> List[str]:
+    products = cb_pub.resolve_reserve_products()
+    if not products:
+        raise RuntimeError("No reserve products resolved. Check RESERVE_PRODUCTS / STABLES_PRODUCTS.")
+    return products
+
 
 def _write_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps(obj) + "\n")
+    _ensure_outdir()
+    with open(path, "a") as handle:
+        handle.write(json.dumps(obj) + "\n")
+
+
+def _append_csv(path: str, row: Dict[str, str]) -> None:
+    _ensure_outdir()
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 def _balances() -> Dict[str, Decimal]:
-    bals = cb_priv.get_balances()
     out: Dict[str, Decimal] = {}
-    for b in bals:
-        sym = b.get("currency") or b.get("asset") or b.get("symbol")
-        val = b.get("available") or b.get("available_balance") or b.get("available_for_trading")
-        if isinstance(val, dict): val = val.get("value")
-        if not sym or val is None: continue
-        try: out[str(sym)] = Decimal(str(val))
-        except Exception: pass
+    for entry in cb_priv.get_balances():
+        symbol = entry.get("currency") or entry.get("asset") or entry.get("symbol")
+        value = entry.get("available") or entry.get("available_balance") or entry.get("available_for_trading")
+        if isinstance(value, dict):
+            value = value.get("value")
+        if symbol and value is not None:
+            try:
+                out[str(symbol)] = Decimal(str(value))
+            except Exception:
+                pass
     return out
 
-def _reserve_topup_log(row: Dict[str,str]) -> None:
-    exists = os.path.exists(RESERVE_LOG)
-    with open(RESERVE_LOG, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists: w.writeheader()
-        w.writerow(row)
 
-def _post_maker_buy(product_id: str, usd_notional: Decimal) -> Optional[str]:
-    # product like USDT-USD / USDC-USD
-    bid, ask = cb_pub.get_best_bid_ask(product_id)
-    price_inc = q(next((p for p in cb_pub.get_products() if p.get("product_id")==product_id), {}).get("price_increment", "0.0001"))
-    base_inc  = q(next((p for p in cb_pub.get_products() if p.get("product_id")==product_id), {}).get("base_increment", "0.01"))
-    # try paying near bid
-    price = Decimal(str(bid))
-    size  = (usd_notional / price).quantize(base_inc)
-    ok, resp = cb_priv.place_limit_order(product_id, side="BUY", size=str(size), limit_price=str(price), post_only=True, client_order_id=f"reserve-{int(time.time())}")
-    if ok:
-        return resp.get("order_id")
-    return None
+def _product_map() -> Dict[str, Dict[str, Any]]:
+    return {str(p.get("product_id")): p for p in cb_pub.get_products() if p.get("product_id")}
 
-def _ensure_reserves(bals: Dict[str, Decimal]) -> None:
-    actions: List[str] = []
-    # maintain USD for BUY legs & top-ups
-    if bals.get("USD", Decimal("0")) < MIN_USD:
-        # attempt to SELL a bit of USDT->USD or USDC->USD to raise USD
-        for base in ("USDT-USD","USDC-USD"):
-            # if we have base > threshold, sell TOPUP_UNIT worth
-            asset = base.split("-")[0]
-            if bals.get(asset, Decimal("0")) > Decimal("1"):
-                bid, ask = cb_pub.get_best_bid_ask(base)
-                price = Decimal(str(bid))
-                size  = (TOPUP_UNIT / price)
-                cb_priv.place_limit_order(base, side="SELL", size=str(size), limit_price=str(price), post_only=True, client_order_id=f"usd-raise-{int(time.time())}")
-                actions.append(f"SELL {asset}->{base.split('-')[1]} {size}@{price}")
-                break
 
-    # keep USDT supply
-    if bals.get("USDT", Decimal("0")) < MIN_USDT and bals.get("USD", Decimal("0")) >= TOPUP_UNIT:
-        oid = _post_maker_buy("USDT-USD", TOPUP_UNIT)
-        if oid: actions.append(f"BUY USDT-USD ${TOPUP_UNIT} oid={oid}")
+def _base_quote(product_id: str, products: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
+    product = products.get(product_id)
+    if not product:
+        raise ValueError(f"Unknown product_id {product_id}")
+    base = str(product.get("base_currency_id") or product.get("base_currency") or "")
+    quote = str(product.get("quote_currency_id") or product.get("quote_currency") or "")
+    if not base or not quote:
+        raise ValueError(f"Could not determine base/quote for {product_id}")
+    return base, quote
 
-    # keep USDC supply
-    if bals.get("USDC", Decimal("0")) < MIN_USDC and bals.get("USD", Decimal("0")) >= TOPUP_UNIT:
-        oid = _post_maker_buy("USDC-USD", TOPUP_UNIT)
-        if oid: actions.append(f"BUY USDC-USD ${TOPUP_UNIT} oid={oid}")
 
-    if actions:
-        _reserve_topup_log({"ts": str(int(time.time())), "actions": " | ".join(actions)})
+def _min_balance(symbol: str) -> Decimal:
+    return Decimal(os.getenv(f"RESERVE_MIN_{symbol}", "50"))
 
-def _poison_old_tickets() -> None:
-    # optional: truncate the ticket file to avoid resubmitting stale ones in other processes
+
+def _topup_unit() -> Decimal:
+    return Decimal(os.getenv("RESERVE_TOPUP_USD", "50"))
+
+
+def _reserve_order_open(product_id: str) -> bool:
     try:
-        with open(TICKET_PATH) as f:
-            rows = list(csv.DictReader(f))
-        if rows:
-            rows[0]["reason"] = "consumed_by_controller"
-            with open(TICKET_PATH, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                w.writeheader(); w.writerow(rows[0])
+        orders = cb_priv.get_open_orders(product_id=product_id)
     except Exception:
-        pass
+        return False
+    for order in orders:
+        client_id = str(order.get("client_order_id") or order.get("client_oid") or "")
+        if client_id.startswith(RESERVE_ORDER_PREFIX):
+            return True
+    return False
 
-def main():
-    print("[controller] running; Ctrl+C to stop.")
+
+def _load_submitter_state() -> Dict[str, Any]:
+    if not os.path.exists(SUBMITTER_STATE_PATH):
+        return {"stage": "IDLE"}
+    try:
+        with open(SUBMITTER_STATE_PATH) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {"stage": "IDLE"}
+    except Exception:
+        return {"stage": "IDLE"}
+
+
+def _submitter_busy_products() -> List[str]:
+    state = _load_submitter_state()
+    stage = str(state.get("stage") or "IDLE")
+    if stage == "IDLE":
+        return []
+    product_id = str(state.get("product_id") or "")
+    return [product_id] if product_id else []
+
+
+def _submit_limit(product_id: str, side: str, usd_notional: Decimal, client_suffix: str) -> Optional[str]:
+    products = _product_map()
+    product = products.get(product_id)
+    if not product:
+        return None
+
+    price_inc = q(product.get("price_increment") or product.get("quote_increment") or "0.0001")
+    base_inc = q(product.get("base_increment") or "0.01")
+    min_size = q(product.get("min_order_size") or product.get("base_min_size") or "0")
+    bid, ask = cb_pub.get_best_bid_ask(product_id)
+    raw_price = bid if side == "BUY" else ask
+    if raw_price <= 0:
+        return None
+
+    price = round_price(q(raw_price), price_inc, mode="down")
+    size = round_size(usd_notional / price, base_inc, mode="down")
+    if size < min_size:
+        return None
+
+    client_order_id = f"{RESERVE_ORDER_PREFIX}{client_suffix}-{int(time.time())}"
+    ok, resp = cb_priv.place_limit_order(
+        product_id=product_id,
+        side=side,
+        size=str(size),
+        limit_price=str(price),
+        post_only=True,
+        client_order_id=client_order_id,
+    )
+    if not ok:
+        return None
+    return str(resp.get("order_id") or (resp.get("success_response") or {}).get("order_id") or "")
+
+
+def _reserve_actions(balances: Dict[str, Decimal], busy_products: List[str]) -> List[str]:
+    actions: List[str] = []
+    products = _product_map()
+    unit = _topup_unit()
+    usd_floor = _min_balance("USD")
+    busy_products_set = set(busy_products)
+
+    if busy_products_set:
+        return []
+
+    if balances.get("USD", Decimal("0")) < usd_floor:
+        for product_id in _products():
+            if product_id in busy_products_set:
+                continue
+            base, quote = _base_quote(product_id, products)
+            if quote != "USD":
+                continue
+            if _reserve_order_open(product_id):
+                continue
+            if balances.get(base, Decimal("0")) <= unit:
+                continue
+            order_id = _submit_limit(product_id, "SELL", unit, f"raise-usd-{base.lower()}")
+            if order_id:
+                actions.append(f"SELL {product_id} raise USD order_id={order_id}")
+                return actions
+
+    for product_id in _products():
+        if product_id in busy_products_set:
+            continue
+        base, quote = _base_quote(product_id, products)
+        if quote != "USD":
+            continue
+        if _reserve_order_open(product_id):
+            continue
+        base_floor = _min_balance(base)
+        usd_available = balances.get("USD", Decimal("0"))
+        if balances.get(base, Decimal("0")) >= base_floor:
+            continue
+        if usd_available - unit < usd_floor:
+            continue
+        order_id = _submit_limit(product_id, "BUY", unit, f"topup-{base.lower()}")
+        if order_id:
+            actions.append(f"BUY {product_id} top-up order_id={order_id}")
+
+    return actions
+
+
+def main() -> None:
+    chosen = _products()
+    print(f"[controller] reserve controller running for {', '.join(chosen)}; Ctrl+C to stop.")
     while True:
         try:
-            bals = _balances()
-            _ensure_reserves(bals)
-
-            # Example loop could also check open orders, stale parents, etc.
-            # Keep lightweight and let submitter handle placements.
-
-            _write_jsonl(STATE_PATH, {"ts": int(time.time()), "balances": {k: str(v) for k,v in bals.items()}})
-
-            _poison_old_tickets()  # avoid duplicate consumption if you run multiple processes
-
+            balances = _balances()
+            busy_products = _submitter_busy_products()
+            actions = _reserve_actions(balances, busy_products)
+            state_row = {
+                "ts": int(time.time()),
+                "products": chosen,
+                "busy_products": busy_products,
+                "balances": {k: str(v) for k, v in balances.items()},
+                "actions": actions,
+            }
+            _write_jsonl(STATE_PATH, state_row)
+            if actions:
+                _append_csv(
+                    RESERVE_LOG,
+                    {
+                        "ts": str(state_row["ts"]),
+                        "actions": " | ".join(actions),
+                    },
+                )
+                print(f"[controller] {' | '.join(actions)}")
         except KeyboardInterrupt:
             print("[controller] stopping")
             break
-        except Exception as e:
-            _write_jsonl(STATE_PATH, {"ts": int(time.time()), "error": str(e)})
+        except Exception as exc:
+            _write_jsonl(STATE_PATH, {"ts": int(time.time()), "error": str(exc)})
+            print(f"[controller] error: {exc}")
         finally:
             time.sleep(POLL_SECS)
+
 
 if __name__ == "__main__":
     main()

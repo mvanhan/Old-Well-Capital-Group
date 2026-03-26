@@ -1,5 +1,3 @@
-
-# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -8,9 +6,9 @@ __pycache__/
 .venv/
 .env
 
-# OS
 .DS_Store
 
-# Project
+output_stables/
+out/
 logs/
-output/*.csv
+*.log

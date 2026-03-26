@@ -1,50 +1,83 @@
 #!/usr/bin/env python3
-"""
-Manual reserve manager (you can still run this on demand).
-The controller already calls equivalent routines automatically when thresholds are breached.
-"""
 from __future__ import annotations
-import os, argparse, time
-from decimal import Decimal
-from typing import Dict, Any, Tuple
 
-from broker import coinbase_public as cb_pub  # type: ignore
+import argparse
+import time
+from decimal import Decimal
+from typing import Dict
+
 from broker import coinbase_private as cb_priv  # type: ignore
+from broker import coinbase_public as cb_pub  # type: ignore
 from owcg_utils.precision import round_price, round_size
 
-def q(x) -> Decimal: return x if isinstance(x, Decimal) else Decimal(str(x))
 
-def _balances() -> Dict[str, Decimal]:
-    out: Dict[str, Decimal] = {}
-    for b in cb_priv.get_balances():
-        sym = b.get("currency") or b.get("asset") or b.get("symbol")
-        val = b.get("available") or b.get("available_balance") or b.get("available_for_trading")
-        if isinstance(val, dict): val = val.get("value")
-        if sym and val is not None:
-            out[str(sym)] = q(val)
-    return out
+def q(x) -> Decimal:
+    return x if isinstance(x, Decimal) else Decimal(str(x))
 
-def buy_stable(product_id: str, usd_notional: Decimal) -> None:
-    # Place maker BUY near bid
-    prods = cb_pub.get_products()
-    p = next((pp for pp in prods if pp.get("product_id")==product_id), None)
-    if not p: raise RuntimeError(f"unknown {product_id}")
-    base_inc  = q(p.get("base_increment","0.01"))
-    price_inc = q(p.get("price_increment", p.get("quote_increment","0.0001")))
+
+def _product_map() -> Dict[str, Dict[str, str]]:
+    return {str(p.get("product_id")): p for p in cb_pub.get_products() if p.get("product_id")}
+
+
+def _product(product_id: str) -> Dict[str, str]:
+    product = _product_map().get(product_id)
+    if not product:
+        raise ValueError(f"Unknown product_id {product_id}")
+    return product
+
+
+def _maker_price(product_id: str, side: str) -> Decimal:
     bid, ask = cb_pub.get_best_bid_ask(product_id)
-    price = round_price(bid, price_inc)
-    size  = round_size(usd_notional / price, base_inc)
-    ok, resp = cb_priv.place_limit_order(product_id, side="BUY", size=str(size), limit_price=str(price), post_only=True, client_order_id=f"manual-reserve-{int(time.time())}")
+    if bid <= 0 or ask <= 0:
+        raise RuntimeError(f"Bad quote for {product_id}: bid={bid} ask={ask}")
+    return q(bid if side.upper() == "BUY" else ask)
+
+
+def place_manual_order(product_id: str, side: str, usd_notional: Decimal) -> str:
+    side = side.upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+
+    product = _product(product_id)
+    base_inc = q(product.get("base_increment", "0.01"))
+    price_inc = q(product.get("price_increment") or product.get("quote_increment") or "0.0001")
+    min_size = q(product.get("min_order_size") or product.get("base_min_size") or "0")
+
+    entry = round_price(_maker_price(product_id, side), price_inc, mode="down")
+    size = round_size(usd_notional / entry, base_inc, mode="down")
+    if size < min_size:
+        raise ValueError(f"Computed size {size} is below min_size {min_size}")
+
+    client_order_id = f"manual-reserve-{int(time.time())}"
+    ok, resp = cb_priv.place_limit_order(
+        product_id=product_id,
+        side=side,
+        size=str(size),
+        limit_price=str(entry),
+        post_only=True,
+        client_order_id=client_order_id,
+    )
     if not ok:
         raise RuntimeError(resp)
-    print(f"[reserve] BUY {product_id} {size}@{price} (notional ~${(size*price):.2f}) id={resp.get('order_id')}")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--product", default="USDT-USD", help="USDT-USD or USDC-USD")
-    ap.add_argument("--usd", default="50", help="USD notional to buy as float/str")
-    args = ap.parse_args()
-    buy_stable(args.product, Decimal(str(args.usd)))
+    order_id = resp.get("order_id") or (resp.get("success_response") or {}).get("order_id") or ""
+    print(f"[manual-reserve] {side} {product_id} {size}@{entry} order_id={order_id}")
+    return str(order_id)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Manual reserve adjustment tool.")
+    parser.add_argument("--product", default="USDC-USD", help="Coinbase product_id, e.g. USDC-USD")
+    parser.add_argument("--side", default="BUY", choices=["BUY", "SELL"], help="Order side")
+    parser.add_argument("--usd", default="50", help="Approximate USD notional")
+    args = parser.parse_args()
+
+    place_manual_order(
+        product_id=args.product,
+        side=args.side,
+        usd_notional=Decimal(str(args.usd)),
+    )
+
 
 if __name__ == "__main__":
     main()
