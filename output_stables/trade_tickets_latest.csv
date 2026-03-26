@@ -1,2 +1,0 @@
-ts,product_id,side,reason
-1758918496,NA,NONE,"scanner_exception ValueError: dict contains fields not in fieldnames: 'post_only', 'bracket_desired'"

@@ -72,3 +72,7 @@ ts,product_id,side,entry_price,tp_price,sl_price,base_size,dev_bps,rr,hold_minut
 1758909366,USDT-USDC,NONE,,,,,8.0000,,,insufficient_balance,,,,
 1758909376,USDT-USDC,NONE,,,,,7.0000,,,insufficient_balance,,,,
 1760653865,2025-10-16 18:31:06 EDT,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946201,2026-02-24 10:16:42 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946218,2026-02-24 10:17:00 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946235,2026-02-24 10:17:17 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946253,2026-02-24 10:17:35 EST,USDT-USD,NONE,bad_quote bid=0 ask=0

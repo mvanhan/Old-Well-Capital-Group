@@ -1,2 +1,5 @@
-ts,product_id,side,entry_price,tp_price,sl_price,base_size,dev_bps,rr,hold_minutes,reason,risk_dollars,notional,gate_bps,depth_note
-1760653865,2025-10-16 18:31:06 EDT,USDT-USD,NONE,bad_quote bid=0 ask=0
+ts,ts_human,product_id,side,reason
+1771946201,2026-02-24 10:16:42 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946218,2026-02-24 10:17:00 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946235,2026-02-24 10:17:17 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
+1771946253,2026-02-24 10:17:35 EST,USDT-USD,NONE,bad_quote bid=0 ask=0
