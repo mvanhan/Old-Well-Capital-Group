@@ -61,22 +61,24 @@ TICKET_HEADER = [
 def _balances() -> Dict[str, Decimal]:
     if os.getenv("OWCG_OFFLINE") == "1":
         return {"USDC": Decimal("1000"), "USD": Decimal("1000")}
-    try:
-        from broker import coinbase_private as cb_priv  # type: ignore
-        out: Dict[str, Decimal] = {}
-        for entry in cb_priv.get_balances():
-            symbol = entry.get("currency") or entry.get("asset") or entry.get("symbol")
-            value = entry.get("available") or entry.get("available_balance") or entry.get("available_for_trading")
-            if isinstance(value, dict):
-                value = value.get("value")
-            if symbol and value is not None:
-                try:
-                    out[str(symbol)] = Decimal(str(value))
-                except Exception:
-                    pass
-        return out
-    except Exception:
-        return {}
+
+    from broker import coinbase_private as cb_priv  # type: ignore
+
+    out: Dict[str, Decimal] = {}
+    entries = cb_priv.get_balances()
+    for entry in entries:
+        symbol = entry.get("currency") or entry.get("asset") or entry.get("symbol")
+        value = entry.get("available") or entry.get("available_balance") or entry.get("available_for_trading")
+        if isinstance(value, dict):
+            value = value.get("value")
+        if symbol and value is not None:
+            try:
+                out[str(symbol)] = Decimal(str(value))
+            except Exception:
+                pass
+    if not out:
+        raise RuntimeError("No balances returned from Coinbase. Check API key/secret, permissions, and account access.")
+    return out
 
 
 def _ts() -> int:

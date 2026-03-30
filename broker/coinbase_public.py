@@ -107,13 +107,45 @@ def _offline_products() -> List[Dict[str, Any]]:
     ]
 
 
+def _collect_products(path: str) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    cursor: Optional[str] = None
+    out: List[Dict[str, Any]] = []
+    while True:
+        params: Dict[str, Any] = {"limit": 250}
+        if cursor:
+            params["cursor"] = cursor
+        data = _request_get(path, params)
+        products = data.get("products") if isinstance(data, dict) else None
+        batch = products if isinstance(products, list) else []
+        for raw in batch:
+            normalized = _normalize_product(raw)
+            product_id = normalized.get("product_id")
+            if product_id and product_id not in seen:
+                seen.add(product_id)
+                out.append(normalized)
+        pagination = data.get("pagination") if isinstance(data, dict) else None
+        next_cursor = None
+        if isinstance(pagination, dict):
+            next_cursor = pagination.get("next_cursor")
+        if not next_cursor:
+            break
+        cursor = str(next_cursor)
+    return out
+
+
 def get_products() -> List[Dict[str, Any]]:
     client = _client()
     if client is None:
         return _offline_products()
-    data = _request_get("/api/v3/brokerage/products")
-    products = data.get("products") if isinstance(data, dict) else data
-    return [_normalize_product(p) for p in (products or [])]
+    for path in ("/api/v3/brokerage/market/products", "/api/v3/brokerage/products"):
+        try:
+            products = _collect_products(path)
+            if products:
+                return products
+        except Exception:
+            continue
+    return []
 
 
 def get_product(product_id: str) -> Optional[Dict[str, Any]]:
@@ -124,12 +156,16 @@ def get_product(product_id: str) -> Optional[Dict[str, Any]]:
             if product["product_id"] == normalized:
                 return product
         return None
-    try:
-        data = _request_get(f"/api/v3/brokerage/products/{normalized}")
-        if isinstance(data, dict) and data.get("product_id"):
-            return _normalize_product(data)
-    except Exception:
-        pass
+    for path in (
+        f"/api/v3/brokerage/market/products/{normalized}",
+        f"/api/v3/brokerage/products/{normalized}",
+    ):
+        try:
+            data = _request_get(path)
+            if isinstance(data, dict) and data.get("product_id"):
+                return _normalize_product(data)
+        except Exception:
+            continue
     for product in get_products():
         if str(product.get("product_id")) == normalized:
             return product
@@ -161,20 +197,31 @@ def get_fee_eligible_stable_products() -> List[Dict[str, Any]]:
     return out
 
 
+def _validate_products(products: List[str], label: str) -> List[str]:
+    live_products = {str(p.get("product_id") or "").upper() for p in get_products()}
+    missing = [p for p in products if p not in live_products]
+    if missing:
+        raise RuntimeError(f"Configured {label} not found in Coinbase product list: {', '.join(missing)}")
+    return products
+
+
 def resolve_trading_products() -> List[str]:
     explicit = [p.strip().upper() for p in os.getenv("STABLES_PRODUCTS", "").split(",") if p.strip()]
     auto = os.getenv("STABLES_AUTO_DISCOVER", "0").strip().lower() in {"1", "true", "yes"}
     if explicit:
-        return explicit
+        return _validate_products(explicit, "STABLES_PRODUCTS")
     if auto:
-        return [str(p["product_id"]).upper() for p in get_fee_eligible_stable_products()]
-    return ["USDC-USD"]
+        products = [str(p["product_id"]).upper() for p in get_fee_eligible_stable_products()]
+        if not products:
+            raise RuntimeError("No fee-eligible stable products found from live Coinbase product list")
+        return products
+    return []
 
 
 def resolve_reserve_products() -> List[str]:
     explicit = [p.strip().upper() for p in os.getenv("RESERVE_PRODUCTS", "").split(",") if p.strip()]
     if explicit:
-        return explicit
+        return _validate_products(explicit, "RESERVE_PRODUCTS")
     return resolve_trading_products()
 
 
@@ -201,27 +248,28 @@ def get_best_bid_ask(product_id: str) -> Tuple[Decimal, Decimal]:
 
     normalized = str(product_id).upper()
 
-    try:
-        data = _request_get("/api/v3/brokerage/best_bid_ask", {"product_ids": normalized})
-        books = data.get("pricebooks") if isinstance(data, dict) else []
-        if books:
-            book = books[0]
-            bids = _extract_price_size_rows(book.get("bids"))
-            asks = _extract_price_size_rows(book.get("asks"))
-            if bids and asks:
-                return Decimal(bids[0][0]), Decimal(asks[0][0])
-    except Exception:
-        pass
-
-    try:
-        data = _request_get(f"/api/v3/brokerage/products/{normalized}/ticker")
-        if isinstance(data, dict):
-            bid = data.get("bid") or data.get("best_bid")
-            ask = data.get("ask") or data.get("best_ask")
-            if bid is not None and ask is not None:
-                return Decimal(str(bid)), Decimal(str(ask))
-    except Exception:
-        pass
+    for path, params in (
+        (f"/api/v3/brokerage/market/products/{normalized}/ticker", {"limit": 1}),
+        ("/api/v3/brokerage/best_bid_ask", {"product_ids": normalized}),
+        (f"/api/v3/brokerage/products/{normalized}/ticker", None),
+    ):
+        try:
+            data = _request_get(path, params)
+            if path.endswith("/ticker"):
+                bid = data.get("best_bid") or data.get("bid")
+                ask = data.get("best_ask") or data.get("ask")
+                if bid is not None and ask is not None:
+                    return Decimal(str(bid)), Decimal(str(ask))
+            else:
+                books = data.get("pricebooks") if isinstance(data, dict) else []
+                if books:
+                    book = books[0]
+                    bids = _extract_price_size_rows(book.get("bids"))
+                    asks = _extract_price_size_rows(book.get("asks"))
+                    if bids and asks:
+                        return Decimal(bids[0][0]), Decimal(asks[0][0])
+        except Exception:
+            continue
 
     try:
         book = get_l2(normalized, depth=1)
@@ -242,8 +290,8 @@ def get_l2(product_id: str, depth: int = 5) -> Dict[str, List[List[str]]]:
 
     normalized = str(product_id).upper()
     attempts = [
-        ("/api/v3/brokerage/product_book", {"product_id": normalized, "limit": depth}),
         ("/api/v3/brokerage/market/product_book", {"product_id": normalized, "limit": depth}),
+        ("/api/v3/brokerage/product_book", {"product_id": normalized, "limit": depth}),
     ]
     for path, params in attempts:
         try:
@@ -263,10 +311,7 @@ def get_l2(product_id: str, depth: int = 5) -> Dict[str, List[List[str]]]:
 def get_accounts() -> List[Dict[str, Any]]:
     client = _client()
     if client is None:
-        return [
-            {"currency": "USD", "available": "1000"},
-            {"currency": "USDC", "available": "1000"},
-        ]
+        return [{"currency": "USD", "available": "1000"}, {"currency": "USDC", "available": "1000"}]
     try:
         data = _request_get("/api/v3/brokerage/accounts")
         if isinstance(data, dict):

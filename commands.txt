@@ -1,3 +1,2 @@
-python run_strategy_stables.py
-python run_live_coinbase_stables.py
-python run_controller_stables.py
+python test_coinbase_auth.py
+python run_bot_stables.py
