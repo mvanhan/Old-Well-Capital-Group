@@ -84,7 +84,7 @@ def _min_balance(symbol: str) -> Decimal:
     return Decimal(os.getenv(f"RESERVE_MIN_{symbol}", "50"))
 
 
-def _topup_unit() -> Decimal:
+def _max_topup_unit_usd() -> Decimal:
     return Decimal(os.getenv("RESERVE_TOPUP_USD", "50"))
 
 
@@ -111,13 +111,12 @@ def _load_submitter_state() -> Dict[str, Any]:
         return {"stage": "IDLE"}
 
 
-def _submitter_busy_products() -> List[str]:
+def _busy_products() -> List[str]:
     state = _load_submitter_state()
-    stage = str(state.get("stage") or "IDLE")
-    if stage == "IDLE":
+    if str(state.get("stage") or "IDLE") == "IDLE":
         return []
-    product_id = str(state.get("product_id") or "")
-    return [product_id] if product_id else []
+    product = str(state.get("product_id") or "")
+    return [product] if product else []
 
 
 def _submit_limit(product_id: str, side: str, usd_notional: Decimal, client_suffix: str) -> Optional[str]:
@@ -125,20 +124,14 @@ def _submit_limit(product_id: str, side: str, usd_notional: Decimal, client_suff
     product = products.get(product_id)
     if not product:
         return None
-
     price_inc = q(product.get("price_increment") or product.get("quote_increment") or "0.0001")
     base_inc = q(product.get("base_increment") or "0.01")
     min_size = q(product.get("min_order_size") or product.get("base_min_size") or "0")
-    bid, ask = cb_pub.get_best_bid_ask(product_id)
-    raw_price = bid if side == "BUY" else ask
-    if raw_price <= 0:
-        return None
-
-    price = round_price(q(raw_price), price_inc, mode="down")
-    size = round_size(usd_notional / price, base_inc, mode="down")
+    raw = cb_pub.get_maker_limit_price(product_id, side)
+    price = round_price(raw, price_inc, mode="down" if side.upper() == "BUY" else "up")
+    size = round_size(usd_notional / price, base_inc, mode="down") if price > 0 else Decimal("0")
     if size < min_size:
         return None
-
     client_order_id = f"{RESERVE_ORDER_PREFIX}{client_suffix}-{int(time.time())}"
     ok, resp = cb_priv.place_limit_order(
         product_id=product_id,
@@ -156,44 +149,49 @@ def _submit_limit(product_id: str, side: str, usd_notional: Decimal, client_suff
 def _reserve_actions(balances: Dict[str, Decimal], busy_products: List[str]) -> List[str]:
     actions: List[str] = []
     products = _product_map()
-    unit = _topup_unit()
     usd_floor = _min_balance("USD")
-    busy_products_set = set(busy_products)
-
-    if busy_products_set:
-        return []
+    max_unit = _max_topup_unit_usd()
+    busy = set(busy_products)
 
     if balances.get("USD", Decimal("0")) < usd_floor:
+        usd_shortfall = usd_floor - balances.get("USD", Decimal("0"))
         for product_id in _products():
-            if product_id in busy_products_set:
+            if product_id in busy or _reserve_order_open(product_id):
                 continue
             base, quote = _base_quote(product_id, products)
             if quote != "USD":
                 continue
-            if _reserve_order_open(product_id):
+            base_floor = _min_balance(base)
+            available_to_sell = balances.get(base, Decimal("0")) - base_floor
+            if available_to_sell <= 0:
                 continue
-            if balances.get(base, Decimal("0")) <= unit:
+            price = cb_pub.get_maker_limit_price(product_id, "SELL")
+            notional_capacity = available_to_sell * price
+            usd_notional = min(max_unit, usd_shortfall, notional_capacity)
+            if usd_notional <= 0:
                 continue
-            order_id = _submit_limit(product_id, "SELL", unit, f"raise-usd-{base.lower()}")
+            order_id = _submit_limit(product_id, "SELL", usd_notional, f"raise-usd-{base.lower()}")
             if order_id:
                 actions.append(f"SELL {product_id} raise USD order_id={order_id}")
                 return actions
 
     for product_id in _products():
-        if product_id in busy_products_set:
+        if product_id in busy or _reserve_order_open(product_id):
             continue
         base, quote = _base_quote(product_id, products)
         if quote != "USD":
             continue
-        if _reserve_order_open(product_id):
-            continue
         base_floor = _min_balance(base)
-        usd_available = balances.get("USD", Decimal("0"))
-        if balances.get(base, Decimal("0")) >= base_floor:
+        current_base = balances.get(base, Decimal("0"))
+        if current_base >= base_floor:
             continue
-        if usd_available - unit < usd_floor:
+        price = cb_pub.get_maker_limit_price(product_id, "BUY")
+        usd_shortfall = (base_floor - current_base) * price
+        usd_available = balances.get("USD", Decimal("0")) - usd_floor
+        usd_notional = min(max_unit, usd_shortfall, usd_available)
+        if usd_notional <= 0:
             continue
-        order_id = _submit_limit(product_id, "BUY", unit, f"topup-{base.lower()}")
+        order_id = _submit_limit(product_id, "BUY", usd_notional, f"topup-{base.lower()}")
         if order_id:
             actions.append(f"BUY {product_id} top-up order_id={order_id}")
 
@@ -206,7 +204,7 @@ def main() -> None:
     while True:
         try:
             balances = _balances()
-            busy_products = _submitter_busy_products()
+            busy_products = _busy_products()
             actions = _reserve_actions(balances, busy_products)
             state_row = {
                 "ts": int(time.time()),
@@ -217,13 +215,7 @@ def main() -> None:
             }
             _write_jsonl(STATE_PATH, state_row)
             if actions:
-                _append_csv(
-                    RESERVE_LOG,
-                    {
-                        "ts": str(state_row["ts"]),
-                        "actions": " | ".join(actions),
-                    },
-                )
+                _append_csv(RESERVE_LOG, {"ts": str(state_row["ts"]), "actions": " | ".join(actions)})
                 print(f"[controller] {' | '.join(actions)}")
         except KeyboardInterrupt:
             print("[controller] stopping")

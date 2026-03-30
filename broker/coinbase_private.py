@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import urlencode
 
 try:
     from dotenv import load_dotenv, find_dotenv  # type: ignore
@@ -47,6 +48,21 @@ def _to_dict(value: Any) -> Any:
     return value
 
 
+def _request_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    cl = _client()
+    full_path = path
+    if params:
+        filtered = {k: v for k, v in params.items() if v is not None and v != ""}
+        if filtered:
+            full_path = f"{path}?{urlencode(filtered, doseq=True)}"
+    return _to_dict(cl.get(full_path))
+
+
+def _request_post(path: str, payload: Dict[str, Any]) -> Any:
+    cl = _client()
+    return _to_dict(cl.post(path, payload))
+
+
 def _success_and_payload(resp: Any) -> Tuple[bool, Dict[str, Any]]:
     data = _to_dict(resp)
     if isinstance(data, dict):
@@ -56,9 +72,7 @@ def _success_and_payload(resp: Any) -> Tuple[bool, Dict[str, Any]]:
 
 
 def get_balances() -> List[Dict[str, Any]]:
-    cl = _client()
-    resp = cl.get("/api/v3/brokerage/accounts")
-    data = _to_dict(resp)
+    data = _request_get("/api/v3/brokerage/accounts")
     if isinstance(data, dict):
         return data.get("accounts", [])
     return data if isinstance(data, list) else []
@@ -72,20 +86,38 @@ def place_limit_order(
     post_only: bool,
     client_order_id: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
-    cl = _client()
     payload = {
         "client_order_id": client_order_id or str(uuid.uuid4()),
         "product_id": product_id,
         "side": side.upper(),
         "order_configuration": {
             "limit_limit_gtc": {
-                "post_only": bool(post_only),
+                "base_size": str(size),
                 "limit_price": str(limit_price),
+                "post_only": bool(post_only),
+            }
+        },
+    }
+    return _success_and_payload(_request_post("/api/v3/brokerage/orders", payload))
+
+
+def place_market_ioc_order(
+    product_id: str,
+    side: str,
+    size: str,
+    client_order_id: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    payload = {
+        "client_order_id": client_order_id or str(uuid.uuid4()),
+        "product_id": product_id,
+        "side": side.upper(),
+        "order_configuration": {
+            "market_market_ioc": {
                 "base_size": str(size),
             }
         },
     }
-    return _success_and_payload(cl.post("/api/v3/brokerage/orders", payload))
+    return _success_and_payload(_request_post("/api/v3/brokerage/orders", payload))
 
 
 def place_bracket_order(
@@ -114,8 +146,7 @@ def place_bracket_order(
 
 
 def cancel_order(order_id: str) -> bool:
-    cl = _client()
-    resp = _to_dict(cl.post("/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]}))
+    resp = _request_post("/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
     if isinstance(resp, dict):
         results = resp.get("results") or []
         if results:
@@ -125,16 +156,15 @@ def cancel_order(order_id: str) -> bool:
 
 
 def get_order_status(order_id: str) -> Dict[str, Any]:
-    cl = _client()
-    return _to_dict(cl.get(f"/api/v3/brokerage/orders/historical/{order_id}"))
+    data = _request_get(f"/api/v3/brokerage/orders/historical/{order_id}")
+    return data if isinstance(data, dict) else {"raw": data}
 
 
 def get_open_orders(product_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    cl = _client()
-    path = "/api/v3/brokerage/orders/historical/batch?order_status=OPEN"
+    params: Dict[str, Any] = {"order_status": ["OPEN", "PENDING"]}
     if product_id:
-        path += f"&product_id={product_id}"
-    resp = _to_dict(cl.get(path))
-    if isinstance(resp, dict):
-        return resp.get("orders", [])
-    return resp if isinstance(resp, list) else []
+        params["product_ids"] = [product_id]
+    data = _request_get("/api/v3/brokerage/orders/historical/batch", params)
+    if isinstance(data, dict):
+        return data.get("orders", [])
+    return data if isinstance(data, list) else []

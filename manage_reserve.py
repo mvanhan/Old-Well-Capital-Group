@@ -26,13 +26,6 @@ def _product(product_id: str) -> Dict[str, str]:
     return product
 
 
-def _maker_price(product_id: str, side: str) -> Decimal:
-    bid, ask = cb_pub.get_best_bid_ask(product_id)
-    if bid <= 0 or ask <= 0:
-        raise RuntimeError(f"Bad quote for {product_id}: bid={bid} ask={ask}")
-    return q(bid if side.upper() == "BUY" else ask)
-
-
 def place_manual_order(product_id: str, side: str, usd_notional: Decimal) -> str:
     side = side.upper()
     if side not in {"BUY", "SELL"}:
@@ -43,7 +36,8 @@ def place_manual_order(product_id: str, side: str, usd_notional: Decimal) -> str
     price_inc = q(product.get("price_increment") or product.get("quote_increment") or "0.0001")
     min_size = q(product.get("min_order_size") or product.get("base_min_size") or "0")
 
-    entry = round_price(_maker_price(product_id, side), price_inc, mode="down")
+    raw_price = cb_pub.get_maker_limit_price(product_id, side)
+    entry = round_price(raw_price, price_inc, mode="down" if side == "BUY" else "up")
     size = round_size(usd_notional / entry, base_inc, mode="down")
     if size < min_size:
         raise ValueError(f"Computed size {size} is below min_size {min_size}")
@@ -72,11 +66,7 @@ def main() -> None:
     parser.add_argument("--usd", default="50", help="Approximate USD notional")
     args = parser.parse_args()
 
-    place_manual_order(
-        product_id=args.product,
-        side=args.side,
-        usd_notional=Decimal(str(args.usd)),
-    )
+    place_manual_order(product_id=args.product, side=args.side, usd_notional=Decimal(str(args.usd)))
 
 
 if __name__ == "__main__":
