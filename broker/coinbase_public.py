@@ -111,6 +111,7 @@ def _collect_products(path: str) -> List[Dict[str, Any]]:
     seen: set[str] = set()
     cursor: Optional[str] = None
     out: List[Dict[str, Any]] = []
+
     while True:
         params: Dict[str, Any] = {"limit": 250}
         if cursor:
@@ -124,17 +125,17 @@ def _collect_products(path: str) -> List[Dict[str, Any]]:
             if product_id and product_id not in seen:
                 seen.add(product_id)
                 out.append(normalized)
+
         pagination = data.get("pagination") if isinstance(data, dict) else None
-        next_cursor = None
-        if isinstance(pagination, dict):
-            next_cursor = pagination.get("next_cursor")
+        next_cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
         if not next_cursor:
             break
         cursor = str(next_cursor)
+
     return out
 
 
-def get_products() -> List[Dict[str, Any]]:
+def get_market_products() -> List[Dict[str, Any]]:
     client = _client()
     if client is None:
         return _offline_products()
@@ -148,17 +149,30 @@ def get_products() -> List[Dict[str, Any]]:
     return []
 
 
-def get_product(product_id: str) -> Optional[Dict[str, Any]]:
-    normalized = str(product_id).upper()
+def get_tradable_products() -> List[Dict[str, Any]]:
     client = _client()
     if client is None:
-        for product in _offline_products():
-            if product["product_id"] == normalized:
-                return product
-        return None
+        return _offline_products()
+    try:
+        return _collect_products("/api/v3/brokerage/products")
+    except Exception:
+        return []
+
+
+def get_products() -> List[Dict[str, Any]]:
+    return get_market_products()
+
+
+def get_product(product_id: str) -> Optional[Dict[str, Any]]:
+    normalized = str(product_id).upper()
+
+    for product in get_tradable_products():
+        if product.get("product_id") == normalized:
+            return product
+
     for path in (
-        f"/api/v3/brokerage/market/products/{normalized}",
         f"/api/v3/brokerage/products/{normalized}",
+        f"/api/v3/brokerage/market/products/{normalized}",
     ):
         try:
             data = _request_get(path)
@@ -166,9 +180,11 @@ def get_product(product_id: str) -> Optional[Dict[str, Any]]:
                 return _normalize_product(data)
         except Exception:
             continue
-    for product in get_products():
-        if str(product.get("product_id")) == normalized:
+
+    for product in get_market_products():
+        if product.get("product_id") == normalized:
             return product
+
     return None
 
 
@@ -179,7 +195,7 @@ def get_fee_eligible_stable_products() -> List[Dict[str, Any]]:
         excluded = set(DEFAULT_EXCLUDED_PRODUCTS)
 
     out: List[Dict[str, Any]] = []
-    for product in get_products():
+    for product in get_tradable_products():
         product_id = str(product.get("product_id") or "").upper()
         quote = str(product.get("quote_currency_id") or "").upper()
         status = str(product.get("status") or "").lower()
@@ -197,31 +213,36 @@ def get_fee_eligible_stable_products() -> List[Dict[str, Any]]:
     return out
 
 
-def _validate_products(products: List[str], label: str) -> List[str]:
-    live_products = {str(p.get("product_id") or "").upper() for p in get_products()}
+def _validate_products(products: List[str], label: str, tradable_only: bool = True) -> List[str]:
+    source = get_tradable_products() if tradable_only else get_market_products()
+    live_products = {str(p.get("product_id") or "").upper() for p in source}
     missing = [p for p in products if p not in live_products]
     if missing:
-        raise RuntimeError(f"Configured {label} not found in Coinbase product list: {', '.join(missing)}")
+        universe = "tradable brokerage product list" if tradable_only else "market product list"
+        raise RuntimeError(f"Configured {label} not found in Coinbase {universe}: {', '.join(missing)}")
     return products
 
 
 def resolve_trading_products() -> List[str]:
     explicit = [p.strip().upper() for p in os.getenv("STABLES_PRODUCTS", "").split(",") if p.strip()]
     auto = os.getenv("STABLES_AUTO_DISCOVER", "0").strip().lower() in {"1", "true", "yes"}
+
     if explicit:
-        return _validate_products(explicit, "STABLES_PRODUCTS")
+        return _validate_products(explicit, "STABLES_PRODUCTS", tradable_only=True)
+
     if auto:
         products = [str(p["product_id"]).upper() for p in get_fee_eligible_stable_products()]
         if not products:
-            raise RuntimeError("No fee-eligible stable products found from live Coinbase product list")
+            raise RuntimeError("No fee-eligible stable products found in authenticated Coinbase trading product list")
         return products
+
     return []
 
 
 def resolve_reserve_products() -> List[str]:
     explicit = [p.strip().upper() for p in os.getenv("RESERVE_PRODUCTS", "").split(",") if p.strip()]
     if explicit:
-        return _validate_products(explicit, "RESERVE_PRODUCTS")
+        return _validate_products(explicit, "RESERVE_PRODUCTS", tradable_only=True)
     return resolve_trading_products()
 
 

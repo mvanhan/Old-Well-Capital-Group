@@ -1,31 +1,44 @@
 from __future__ import annotations
 
 from broker import coinbase_private as cb_priv  # type: ignore
-from broker import coinbase_public as cb_pub  # type: ignore
 
+CANDIDATES = [
+    "BTC-USD",
+    "ETH-USD",
+    "BTC-USDC",
+    "USDT-USD",
+    "USDT-USDC",
+    "USD1-USD",
+    "USD1-USDC",
+]
+
+def try_preview(product_id: str) -> None:
+    try:
+        preview = cb_priv._request_post(  # type: ignore
+            "/api/v3/brokerage/orders/preview",
+            {
+                "product_id": product_id,
+                "side": "BUY",
+                "order_configuration": {
+                    "market_market_ioc": {
+                        "quote_size": "10"
+                    }
+                },
+            },
+        )
+        print(f"{product_id}: OK -> {preview}")
+    except Exception as exc:
+        print(f"{product_id}: FAIL -> {exc}")
 
 def main() -> None:
-    products = cb_pub.get_products()
-    if not products:
-        raise RuntimeError("No products returned from Coinbase")
-
-    eligible = cb_pub.get_fee_eligible_stable_products()
     balances = cb_priv.get_balances()
-    if not balances:
-        raise RuntimeError("No balances returned from Coinbase")
-
-    print(f"products={len(products)}")
-    print("eligible_stable_products=")
-    for product in eligible[:20]:
-        print(f"  {product['product_id']}")
-
-    first = eligible[0]["product_id"] if eligible else products[0]["product_id"]
-    bid, ask = cb_pub.get_best_bid_ask(first)
-    print(f"sample_product={first}")
-    print(f"best_bid={bid} best_ask={ask}")
     print(f"balances_returned={len(balances)}")
-    print("OK")
 
+    perms = cb_priv._request_get("/api/v3/brokerage/key_permissions")  # type: ignore
+    print("key_permissions=", perms)
+
+    for product_id in CANDIDATES:
+        try_preview(product_id)
 
 if __name__ == "__main__":
     main()
