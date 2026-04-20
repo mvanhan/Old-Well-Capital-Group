@@ -6,12 +6,13 @@ import json
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 try:
-    from dotenv import load_dotenv, find_dotenv  # type: ignore
+    from dotenv import find_dotenv, load_dotenv  # type: ignore
     load_dotenv(find_dotenv(), override=False)
 except Exception:
     pass
@@ -22,15 +23,17 @@ from owcg_utils.precision import round_price, round_size
 
 OUTDIR = Path("output_stables")
 OUTDIR.mkdir(exist_ok=True)
+
 TICKET_PATH = OUTDIR / "trade_tickets_latest.csv"
 EXEC_LOG = OUTDIR / "submit_exec_history.csv"
 STATE_PATH = OUTDIR / "submitter_state.json"
 CLOSED_LOG = OUTDIR / "closed_trades.csv"
+
 POLL_SECS = int(os.getenv("SUBMITTER_POLL_SECS", "5"))
 PARENT_TTL_SECS = int(os.getenv("PARENT_TTL_SECS", "300"))
 PARENT_PARTIAL_PROMOTE_SECS = int(os.getenv("PARENT_PARTIAL_PROMOTE_SECS", "20"))
 MAX_TICKET_AGE_SECS = int(os.getenv("MAX_TICKET_AGE_SECS", "30"))
-MARKETABLE_EXIT_BUFFER_BPS = Decimal(os.getenv("MARKETABLE_EXIT_BUFFER_BPS", "1.0"))
+POSITION_MAX_AGE_SECS = int(os.getenv("POSITION_MAX_AGE_SECS", str(int(os.getenv("HOLD_MINUTES", "180")) * 60)))
 
 
 def q(x: Any) -> Decimal:
@@ -40,11 +43,15 @@ def q(x: Any) -> Decimal:
 def _boolish(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _now() -> int:
     return int(time.time())
+
+
+def _now_human() -> str:
+    return datetime.fromtimestamp(_now(), tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _load_state() -> Dict[str, Any]:
@@ -64,7 +71,12 @@ def _save_state(state: Dict[str, Any]) -> None:
 
 
 def _append_exec(event: str, details: Dict[str, Any]) -> None:
-    row = {"ts": str(_now()), "event": event, "details": json.dumps(details, sort_keys=True)}
+    row = {
+        "ts": str(_now()),
+        "ts_human": _now_human(),
+        "event": event,
+        "details": json.dumps(details, sort_keys=True),
+    }
     exists = EXEC_LOG.exists()
     with EXEC_LOG.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
@@ -185,7 +197,14 @@ def _rounded_size(product_id: str, size: Decimal) -> Decimal:
     return normalized if normalized >= min_size else Decimal("0")
 
 
-def _place_limit(product_id: str, side: str, size: Decimal, price: Decimal, post_only: bool, client_prefix: str) -> Tuple[bool, Dict[str, Any]]:
+def _place_limit(
+    product_id: str,
+    side: str,
+    size: Decimal,
+    price: Decimal,
+    post_only: bool,
+    client_prefix: str,
+) -> Tuple[bool, Dict[str, Any]]:
     base_inc, price_inc, min_size = _product_specs(product_id)
     size = round_size(size, base_inc, mode="down")
     if side.upper() == "BUY":
@@ -255,10 +274,10 @@ def _submit_parent_from_ticket(ticket: Dict[str, str]) -> Tuple[Dict[str, str], 
 
     if size < min_size:
         raise ValueError(f"size {size} < min_size {min_size}")
-    if side == "SELL" and not (tp < entry and sl > entry):
-        raise ValueError("SELL ticket has invalid TP/SL relationship")
     if side == "BUY" and not (tp > entry and sl < entry):
         raise ValueError("BUY ticket has invalid TP/SL relationship")
+    if side == "SELL" and not (tp < entry and sl > entry):
+        raise ValueError("SELL ticket has invalid TP/SL relationship")
 
     ok, resp = _place_limit(product_id, side, size, entry, post_only=post_only, client_prefix=client_tag)
     if not ok:
@@ -273,11 +292,15 @@ def _submit_parent_from_ticket(ticket: Dict[str, str]) -> Tuple[Dict[str, str], 
     return normalized_ticket, resp
 
 
+def _extract_order_id(payload: Dict[str, Any]) -> str:
+    return str(payload.get("order_id") or (payload.get("success_response") or {}).get("order_id") or "")
+
+
 def _new_parent_state(ticket: Dict[str, str], ticket_id: str, parent_payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = _load_state()
     return {
         "stage": "PARENT_WORKING",
         "ticket_id": ticket_id,
-        "ticket": ticket,
         "product_id": ticket["product_id"],
         "entry_side": ticket["side"].upper(),
         "exit_side": _opposite_side(ticket["side"]),
@@ -285,9 +308,9 @@ def _new_parent_state(ticket: Dict[str, str], ticket_id: str, parent_payload: Di
         "tp_price": ticket["tp_price"],
         "sl_price": ticket["sl_price"],
         "planned_size": ticket["size"],
-        "parent_order_id": str(parent_payload.get("order_id") or (parent_payload.get("success_response") or {}).get("order_id") or ""),
+        "parent_order_id": _extract_order_id(parent_payload),
         "parent_submitted_ts": _now(),
-        "last_completed_ticket_id": _load_state().get("last_completed_ticket_id", ""),
+        "last_completed_ticket_id": current.get("last_completed_ticket_id", ""),
     }
 
 
@@ -295,6 +318,7 @@ def _open_position_state(state: Dict[str, Any], snapshot: Dict[str, Any]) -> Dic
     filled_size = _rounded_size(state["product_id"], snapshot["filled_size"])
     if filled_size <= 0:
         return {"stage": "IDLE", "last_completed_ticket_id": state["ticket_id"]}
+
     entry_avg = snapshot["average_filled_price"] if snapshot["average_filled_price"] > 0 else q(state["entry_price"])
     return {
         "stage": "POSITION_OPEN",
@@ -319,9 +343,10 @@ def _open_position_state(state: Dict[str, Any], snapshot: Dict[str, Any]) -> Dic
 
 
 def _submit_tp_order(state: Dict[str, Any]) -> Dict[str, Any]:
-    size = q(state["position_size"]) - q(state.get("realized_exit_size") or "0")
+    size = _remaining_position(state)
     if size <= 0:
         return state
+
     ok, resp = _place_limit(
         product_id=state["product_id"],
         side=state["exit_side"],
@@ -332,32 +357,34 @@ def _submit_tp_order(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     if not ok:
         raise RuntimeError(resp)
-    state["tp_order_id"] = str(resp.get("order_id") or (resp.get("success_response") or {}).get("order_id") or "")
-    state["tp_working"] = True
-    state["tp_submitted_ts"] = _now()
-    state["tp_accounted_filled_size"] = "0"
-    state["tp_accounted_fees"] = "0"
-    return state
+
+    next_state = dict(state)
+    next_state["tp_order_id"] = _extract_order_id(resp)
+    next_state["tp_working"] = True
+    next_state["tp_submitted_ts"] = _now()
+    next_state["tp_accounted_filled_size"] = "0"
+    next_state["tp_accounted_fees"] = "0"
+    return next_state
 
 
-def _submit_stop_exit(state: Dict[str, Any], remaining: Decimal) -> Dict[str, Any]:
+def _submit_stop_exit(state: Dict[str, Any], remaining: Decimal, reason: str) -> Dict[str, Any]:
     ok, resp = _place_market_ioc(
         product_id=state["product_id"],
         side=state["exit_side"],
         size=remaining,
-        client_prefix="sl",
+        client_prefix=reason,
     )
     if not ok:
         raise RuntimeError(resp)
-    return {
-        **state,
-        "stage": "EXIT_WORKING",
-        "exit_reason": "sl",
-        "exit_order_id": str(resp.get("order_id") or (resp.get("success_response") or {}).get("order_id") or ""),
-        "exit_submitted_ts": _now(),
-        "exit_accounted_filled_size": "0",
-        "exit_accounted_fees": "0",
-    }
+
+    next_state = dict(state)
+    next_state["stage"] = "EXIT_WORKING"
+    next_state["exit_reason"] = reason
+    next_state["exit_order_id"] = _extract_order_id(resp)
+    next_state["exit_submitted_ts"] = _now()
+    next_state["exit_accounted_filled_size"] = "0"
+    next_state["exit_accounted_fees"] = "0"
+    return next_state
 
 
 def _remaining_position(state: Dict[str, Any]) -> Decimal:
@@ -366,33 +393,49 @@ def _remaining_position(state: Dict[str, Any]) -> Decimal:
 
 
 def _update_realized_from_order(state: Dict[str, Any], snapshot: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    next_state = dict(state)
+
     accounted_size_key = f"{prefix}_accounted_filled_size"
     accounted_fees_key = f"{prefix}_accounted_fees"
-    prev_size = q(state.get(accounted_size_key) or "0")
-    prev_fees = q(state.get(accounted_fees_key) or "0")
+
+    prev_size = q(next_state.get(accounted_size_key) or "0")
+    prev_fees = q(next_state.get(accounted_fees_key) or "0")
     current_size = snapshot["filled_size"]
     current_fees = snapshot["total_fees"]
+
     delta_size = current_size - prev_size
     delta_fees = current_fees - prev_fees
 
     if delta_size > 0:
         avg_price = snapshot["average_filled_price"]
-        state["realized_exit_size"] = str(q(state.get("realized_exit_size") or "0") + delta_size)
-        state["realized_exit_value"] = str(q(state.get("realized_exit_value") or "0") + delta_size * avg_price)
-    if delta_fees > 0:
-        state["realized_exit_fees"] = str(q(state.get("realized_exit_fees") or "0") + delta_fees)
+        next_state["realized_exit_size"] = str(q(next_state.get("realized_exit_size") or "0") + delta_size)
+        next_state["realized_exit_value"] = str(q(next_state.get("realized_exit_value") or "0") + (delta_size * avg_price))
 
-    state[accounted_size_key] = str(current_size)
-    state[accounted_fees_key] = str(current_fees)
-    return state
+    if delta_fees > 0:
+        next_state["realized_exit_fees"] = str(q(next_state.get("realized_exit_fees") or "0") + delta_fees)
+
+    next_state[accounted_size_key] = str(current_size)
+    next_state[accounted_fees_key] = str(current_fees)
+    return next_state
 
 
 def _stop_hit(state: Dict[str, Any]) -> bool:
-    bid, ask = cb_pub.get_best_bid_ask(state["product_id"])
+    try:
+        bid, ask = cb_pub.get_best_bid_ask(state["product_id"])
+    except Exception:
+        return False
+
     sl = q(state["sl_price"])
     if state["entry_side"] == "BUY":
         return q(bid) <= sl
     return q(ask) >= sl
+
+
+def _position_expired(state: Dict[str, Any]) -> bool:
+    opened = int(state.get("position_open_ts") or 0)
+    if opened <= 0 or POSITION_MAX_AGE_SECS <= 0:
+        return False
+    return (_now() - opened) >= POSITION_MAX_AGE_SECS
 
 
 def _write_closed_trade(state: Dict[str, Any], exit_snapshot: Dict[str, Any], reason: str) -> None:
@@ -400,13 +443,21 @@ def _write_closed_trade(state: Dict[str, Any], exit_snapshot: Dict[str, Any], re
     entry_avg = q(state.get("entry_avg_price") or "0")
     realized_size = q(state.get("realized_exit_size") or "0")
     realized_value = q(state.get("realized_exit_value") or "0")
-    exit_avg = (realized_value / realized_size) if realized_size > 0 else exit_snapshot["average_filled_price"]
-    exit_size = min(entry_size, realized_size if realized_size > 0 else entry_size)
+
+    if realized_size > 0:
+        exit_avg = realized_value / realized_size
+        exit_size = min(entry_size, realized_size)
+    else:
+        exit_avg = exit_snapshot["average_filled_price"]
+        exit_size = entry_size
+
     gross = (exit_avg - entry_avg) * exit_size if state["entry_side"] == "BUY" else (entry_avg - exit_avg) * exit_size
     fees = q(state.get("entry_fees") or "0") + q(state.get("realized_exit_fees") or "0")
     net = gross - fees
+
     row = {
         "ts": str(_now()),
+        "ts_human": _now_human(),
         "ticket_id": str(state.get("ticket_id") or ""),
         "product_id": str(state.get("product_id") or ""),
         "entry_side": str(state.get("entry_side") or ""),
@@ -423,19 +474,28 @@ def _write_closed_trade(state: Dict[str, Any], exit_snapshot: Dict[str, Any], re
     _append_closed(row)
 
 
+def _idle_state(last_completed_ticket_id: str = "") -> Dict[str, Any]:
+    return {"stage": "IDLE", "last_completed_ticket_id": last_completed_ticket_id}
+
+
 def _handle_idle(state: Dict[str, Any]) -> Dict[str, Any]:
     ticket = _load_ticket()
     if not ticket:
         return state
+
     ticket_id = ticket.get("ticket_id") or _ticket_hash(ticket)
     if state.get("last_completed_ticket_id") == ticket_id:
         return state
+
     expire_ts = int(ticket.get("expire_ts") or 0)
     ticket_ts = int(ticket.get("ts") or 0)
-    if (expire_ts and _now() > expire_ts) or (ticket_ts and _now() - ticket_ts > MAX_TICKET_AGE_SECS):
+    now = _now()
+
+    if (expire_ts and now > expire_ts) or (ticket_ts and now - ticket_ts > MAX_TICKET_AGE_SECS):
         _append_exec("stale_ticket_discarded", {"ticket_id": ticket_id, "ticket": ticket})
         _clear_ticket_file()
-        return {"stage": "IDLE", "last_completed_ticket_id": state.get("last_completed_ticket_id", "")}
+        return _idle_state(state.get("last_completed_ticket_id", ""))
+
     normalized_ticket, parent_resp = _submit_parent_from_ticket(ticket)
     new_state = _new_parent_state(normalized_ticket, ticket_id, parent_resp)
     _save_state(new_state)
@@ -450,7 +510,7 @@ def _handle_parent(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if _is_terminal_rejected(snapshot):
         _append_exec("parent_rejected", snapshot)
-        return {"stage": "IDLE", "last_completed_ticket_id": state["ticket_id"]}
+        return _idle_state(state["ticket_id"])
 
     if _is_filled(snapshot):
         next_state = _open_position_state(state, snapshot)
@@ -458,9 +518,9 @@ def _handle_parent(state: Dict[str, Any]) -> Dict[str, Any]:
         return next_state
 
     if snapshot["filled_size"] > 0 and age >= PARENT_PARTIAL_PROMOTE_SECS:
-        _cancel_if_possible(state["parent_order_id"])
+        cancelled = _cancel_if_possible(state["parent_order_id"])
         next_state = _open_position_state(state, snapshot)
-        _append_exec("position_opened_from_partial", next_state)
+        _append_exec("position_opened_from_partial", {"cancelled": cancelled, **next_state})
         return next_state
 
     if age >= PARENT_TTL_SECS:
@@ -470,12 +530,22 @@ def _handle_parent(state: Dict[str, Any]) -> Dict[str, Any]:
             next_state = _open_position_state(state, snapshot)
             _append_exec("position_opened_after_ttl", next_state)
             return next_state
-        return {"stage": "IDLE", "last_completed_ticket_id": state["ticket_id"]}
+        return _idle_state(state["ticket_id"])
 
     return state
 
 
 def _handle_position_open(state: Dict[str, Any]) -> Dict[str, Any]:
+    if _position_expired(state):
+        if state.get("tp_working") and state.get("tp_order_id"):
+            _cancel_if_possible(state["tp_order_id"])
+        remaining = _remaining_position(state)
+        if remaining > 0:
+            next_state = _submit_stop_exit(state, remaining, "max_hold")
+            _append_exec("max_hold_exit_submitted", next_state)
+            return next_state
+        return _idle_state(state["ticket_id"])
+
     if not state.get("tp_working"):
         try:
             next_state = _submit_tp_order(state)
@@ -484,7 +554,9 @@ def _handle_position_open(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             _append_exec("tp_submit_failed", {"error": str(exc), **state})
             if _stop_hit(state):
-                return _submit_stop_exit(state, _remaining_position(state))
+                remaining = _remaining_position(state)
+                if remaining > 0:
+                    return _submit_stop_exit(state, remaining, "sl")
             return state
 
     tp_snapshot = _order_snapshot(state["tp_order_id"])
@@ -493,23 +565,26 @@ def _handle_position_open(state: Dict[str, Any]) -> Dict[str, Any]:
     if _remaining_position(state) <= 0:
         _append_exec("tp_filled", tp_snapshot)
         _write_closed_trade(state, tp_snapshot, "tp")
-        return {"stage": "IDLE", "last_completed_ticket_id": state["ticket_id"]}
+        return _idle_state(state["ticket_id"])
 
-    if _is_terminal_rejected(tp_snapshot):
-        state["tp_working"] = False
-        state["tp_order_id"] = ""
-        _append_exec("tp_rejected", tp_snapshot)
-        if _stop_hit(state):
-            return _submit_stop_exit(state, _remaining_position(state))
-        return state
+    if _is_terminal_rejected(tp_snapshot) or _is_terminal_cancelled(tp_snapshot):
+        next_state = dict(state)
+        next_state["tp_working"] = False
+        next_state["tp_order_id"] = ""
+        _append_exec("tp_unavailable", tp_snapshot)
+        if _stop_hit(next_state):
+            remaining = _remaining_position(next_state)
+            if remaining > 0:
+                return _submit_stop_exit(next_state, remaining, "sl")
+        return next_state
 
     if _stop_hit(state):
         _cancel_if_possible(state["tp_order_id"])
         remaining = _remaining_position(state)
         if remaining <= 0:
             _write_closed_trade(state, tp_snapshot, "tp")
-            return {"stage": "IDLE", "last_completed_ticket_id": state["ticket_id"]}
-        next_state = _submit_stop_exit(state, remaining)
+            return _idle_state(state["ticket_id"])
+        next_state = _submit_stop_exit(state, remaining, "sl")
         _append_exec("stop_submitted", next_state)
         return next_state
 
@@ -524,10 +599,10 @@ def _handle_exit_working(state: Dict[str, Any]) -> Dict[str, Any]:
     if remaining <= 0:
         _append_exec("exit_filled", snapshot)
         _write_closed_trade(state, snapshot, str(state.get("exit_reason") or "exit"))
-        return {"stage": "IDLE", "last_completed_ticket_id": state["ticket_id"]}
+        return _idle_state(state["ticket_id"])
 
     if _is_terminal_rejected(snapshot) or _is_terminal_cancelled(snapshot) or _is_filled(snapshot):
-        next_state = _submit_stop_exit(state, remaining)
+        next_state = _submit_stop_exit(state, remaining, str(state.get("exit_reason") or "exit"))
         _append_exec("exit_retried", next_state)
         return next_state
 
@@ -540,6 +615,7 @@ def main() -> None:
         try:
             state = _load_state()
             stage = state.get("stage", "IDLE")
+
             if stage == "IDLE":
                 state = _handle_idle(state)
             elif stage == "PARENT_WORKING":
@@ -549,7 +625,8 @@ def main() -> None:
             elif stage == "EXIT_WORKING":
                 state = _handle_exit_working(state)
             else:
-                state = {"stage": "IDLE", "last_completed_ticket_id": state.get("last_completed_ticket_id", "")}
+                state = _idle_state(state.get("last_completed_ticket_id", ""))
+
             _save_state(state)
         except KeyboardInterrupt:
             print("[submitter] stopping")

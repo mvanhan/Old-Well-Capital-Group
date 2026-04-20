@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 try:
@@ -17,7 +17,21 @@ except Exception:
     RESTClient = None  # type: ignore
 
 
-DEFAULT_EXCLUDED_PRODUCTS = {"USDT-USD", "USDT-USDC"}
+DEFAULT_EXCLUDED_PRODUCTS: Set[str] = set()
+DEFAULT_REFERENCE_ASSETS: Set[str] = {
+    "USD",
+    "USDC",
+    "USDT",
+    "DAI",
+    "PYUSD",
+    "FDUSD",
+    "USDP",
+    "GUSD",
+    "TUSD",
+    "RLUSD",
+    "EURC",
+}
+ACTIVE_STATUSES = {"online", "active", "internal"}
 
 
 def _sanitize_secret(raw: Optional[str]) -> Optional[str]:
@@ -57,6 +71,11 @@ def _boolish(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _split_csv_env(name: str) -> List[str]:
+    raw = os.getenv(name, "")
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
 def _request_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     client = _client()
     if client is None:
@@ -81,7 +100,8 @@ def _normalize_product(product: Dict[str, Any]) -> Dict[str, Any]:
     d["post_only"] = _boolish(d.get("post_only"))
     d["limit_only"] = _boolish(d.get("limit_only") or d.get("is_limit_only") or d.get("order_book_only"))
     d["cancel_only"] = _boolish(d.get("cancel_only") or d.get("is_cancel_only"))
-    d["trading_disabled"] = _boolish(d.get("trading_disabled") or d.get("is_disabled"))
+    d["trading_disabled"] = _boolish(d.get("trading_disabled") or d.get("is_disabled") or d.get("view_only"))
+    d["auction_mode"] = _boolish(d.get("auction_mode") or d.get("auction") or d.get("is_auction_mode"))
     d["status"] = str(d.get("status") or "").lower()
     return d
 
@@ -103,12 +123,28 @@ def _offline_products() -> List[Dict[str, Any]]:
                 "trading_disabled": False,
                 "status": "online",
             }
-        )
+        ),
+        _normalize_product(
+            {
+                "product_id": "USDT-USDC",
+                "base_currency_id": "USDT",
+                "quote_currency_id": "USDC",
+                "base_increment": "0.01",
+                "price_increment": "0.0001",
+                "min_order_size": "1",
+                "fx_stablecoin": True,
+                "post_only": True,
+                "limit_only": False,
+                "cancel_only": False,
+                "trading_disabled": False,
+                "status": "online",
+            }
+        ),
     ]
 
 
 def _collect_products(path: str) -> List[Dict[str, Any]]:
-    seen: set[str] = set()
+    seen: Set[str] = set()
     cursor: Optional[str] = None
     out: List[Dict[str, Any]] = []
 
@@ -188,28 +224,95 @@ def get_product(product_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _status_allows_trading(product: Dict[str, Any]) -> bool:
+    status = str(product.get("status") or "").lower()
+    if product.get("trading_disabled") or product.get("cancel_only") or product.get("auction_mode"):
+        return False
+    if status and status not in ACTIVE_STATUSES:
+        return False
+    return True
+
+
+def _reference_assets(products: List[Dict[str, Any]]) -> Set[str]:
+    assets = set(DEFAULT_REFERENCE_ASSETS)
+    assets.update(_split_csv_env("STABLES_REFERENCE_ASSETS"))
+    for product in products:
+        base = str(product.get("base_currency_id") or "").upper()
+        quote = str(product.get("quote_currency_id") or "").upper()
+        if product.get("fx_stablecoin"):
+            if base:
+                assets.add(base)
+            if quote:
+                assets.add(quote)
+    return {asset for asset in assets if asset}
+
+
+def _allowed_quote_assets(reference_assets: Set[str]) -> Set[str]:
+    configured = set(_split_csv_env("STABLES_ALLOWED_QUOTES"))
+    if configured:
+        return configured
+    return set(reference_assets)
+
+
+def _product_sort_key(product: Dict[str, Any], allowed_quotes: Set[str]) -> Tuple[int, int, int, str, str]:
+    quote = str(product.get("quote_currency_id") or "").upper()
+    product_id = str(product.get("product_id") or "").upper()
+    quote_priority = {
+        "USD": 0,
+        "USDC": 1,
+        "USDT": 2,
+        "DAI": 3,
+        "PYUSD": 4,
+    }.get(quote, 50 if quote in allowed_quotes else 100)
+    post_only_priority = 0 if product.get("post_only") else 1
+    limit_only_priority = 1 if product.get("limit_only") else 0
+    return (quote_priority, post_only_priority, limit_only_priority, quote, product_id)
+
+
 def get_fee_eligible_stable_products() -> List[Dict[str, Any]]:
-    raw_excluded = os.getenv("STABLES_EXCLUDED_PRODUCTS", "")
-    excluded = {item.strip().upper() for item in raw_excluded.split(",") if item.strip()}
+    products = get_tradable_products()
+    if not products:
+        return []
+
+    excluded = set(_split_csv_env("STABLES_EXCLUDED_PRODUCTS"))
     if not excluded:
         excluded = set(DEFAULT_EXCLUDED_PRODUCTS)
 
+    reference_assets = _reference_assets(products)
+    allowed_quotes = _allowed_quote_assets(reference_assets)
+    require_post_only = _boolish(os.getenv("STABLES_REQUIRE_POST_ONLY", "0"))
+    include_limit_only = _boolish(os.getenv("STABLES_INCLUDE_LIMIT_ONLY", "0"))
+    require_flag = _boolish(os.getenv("STABLES_REQUIRE_FX_STABLECOIN_FLAG", "0"))
+
     out: List[Dict[str, Any]] = []
-    for product in get_tradable_products():
+    seen: Set[str] = set()
+
+    for product in products:
         product_id = str(product.get("product_id") or "").upper()
+        base = str(product.get("base_currency_id") or "").upper()
         quote = str(product.get("quote_currency_id") or "").upper()
-        status = str(product.get("status") or "").lower()
-        if not product.get("fx_stablecoin"):
+
+        if not product_id or product_id in seen or product_id in excluded:
             continue
-        if product_id in excluded:
+        if not base or not quote or base == quote:
             continue
-        if quote != "USD":
+        if not _status_allows_trading(product):
             continue
-        if product.get("trading_disabled") or product.get("cancel_only"):
+        if require_post_only and not product.get("post_only"):
             continue
-        if status and status not in {"online", "active", "internal"}:
+        if not include_limit_only and product.get("limit_only"):
             continue
+        if quote not in allowed_quotes:
+            continue
+        if base not in reference_assets or quote not in reference_assets:
+            continue
+        if require_flag and not product.get("fx_stablecoin"):
+            continue
+
+        seen.add(product_id)
         out.append(product)
+
+    out.sort(key=lambda product: _product_sort_key(product, allowed_quotes))
     return out
 
 
@@ -225,7 +328,7 @@ def _validate_products(products: List[str], label: str, tradable_only: bool = Tr
 
 def resolve_trading_products() -> List[str]:
     explicit = [p.strip().upper() for p in os.getenv("STABLES_PRODUCTS", "").split(",") if p.strip()]
-    auto = os.getenv("STABLES_AUTO_DISCOVER", "0").strip().lower() in {"1", "true", "yes"}
+    auto = _boolish(os.getenv("STABLES_AUTO_DISCOVER", "0"))
 
     if explicit:
         return _validate_products(explicit, "STABLES_PRODUCTS", tradable_only=True)
@@ -233,7 +336,10 @@ def resolve_trading_products() -> List[str]:
     if auto:
         products = [str(p["product_id"]).upper() for p in get_fee_eligible_stable_products()]
         if not products:
-            raise RuntimeError("No fee-eligible stable products found in authenticated Coinbase trading product list")
+            raise RuntimeError(
+                "No eligible stable products found. Check Coinbase product availability, STABLES_EXCLUDED_PRODUCTS, "
+                "STABLES_ALLOWED_QUOTES, STABLES_REFERENCE_ASSETS, and STABLES_INCLUDE_LIMIT_ONLY."
+            )
         return products
 
     return []
@@ -284,9 +390,9 @@ def get_best_bid_ask(product_id: str) -> Tuple[Decimal, Decimal]:
             else:
                 books = data.get("pricebooks") if isinstance(data, dict) else []
                 if books:
-                    book = books[0]
-                    bids = _extract_price_size_rows(book.get("bids"))
-                    asks = _extract_price_size_rows(book.get("asks"))
+                    pricebook = books[0]
+                    bids = _extract_price_size_rows(pricebook.get("bids"))
+                    asks = _extract_price_size_rows(pricebook.get("asks"))
                     if bids and asks:
                         return Decimal(bids[0][0]), Decimal(asks[0][0])
         except Exception:

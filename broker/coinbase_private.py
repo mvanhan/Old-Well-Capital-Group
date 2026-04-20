@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 try:
-    from dotenv import load_dotenv, find_dotenv  # type: ignore
+    from dotenv import find_dotenv, load_dotenv  # type: ignore
     load_dotenv(find_dotenv(), override=False)
 except Exception:
     pass
@@ -17,7 +17,7 @@ except Exception:
     RESTClient = None  # type: ignore
 
 
-def _sanitize_secret(raw: str | None) -> str | None:
+def _sanitize_secret(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return raw
     s = raw.strip()
@@ -29,12 +29,12 @@ def _sanitize_secret(raw: str | None) -> str | None:
 def _client() -> RESTClient:
     if RESTClient is None:
         raise RuntimeError("coinbase-advanced-py not installed")
-    key = os.getenv("COINBASE_API_KEY")
-    secret = _sanitize_secret(os.getenv("COINBASE_API_SECRET"))
-    if not key or not secret:
+    api_key = os.getenv("COINBASE_API_KEY", "").strip()
+    api_secret = _sanitize_secret(os.getenv("COINBASE_API_SECRET"))
+    if not api_key or not api_secret:
         raise RuntimeError("COINBASE_API_KEY/SECRET not set")
     timeout = float(os.getenv("CB_SDK_TIMEOUT", "10"))
-    return RESTClient(api_key=key, api_secret=secret, timeout=timeout)
+    return RESTClient(api_key=api_key, api_secret=api_secret, timeout=timeout)
 
 
 def _to_dict(value: Any) -> Any:
@@ -49,33 +49,68 @@ def _to_dict(value: Any) -> Any:
 
 
 def _request_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    cl = _client()
+    client = _client()
     full_path = path
     if params:
         filtered = {k: v for k, v in params.items() if v is not None and v != ""}
         if filtered:
             full_path = f"{path}?{urlencode(filtered, doseq=True)}"
-    return _to_dict(cl.get(full_path))
+    return _to_dict(client.get(full_path))
 
 
 def _request_post(path: str, payload: Dict[str, Any]) -> Any:
-    cl = _client()
-    return _to_dict(cl.post(path, payload))
+    client = _client()
+    return _to_dict(client.post(path, payload))
 
 
 def _success_and_payload(resp: Any) -> Tuple[bool, Dict[str, Any]]:
     data = _to_dict(resp)
-    if isinstance(data, dict):
-        ok = bool(data.get("success", True)) and not data.get("error_response")
-        return ok, data
-    return True, {"raw": data}
+    if not isinstance(data, dict):
+        return True, {"raw": data}
+
+    error_response = data.get("error_response")
+    success_response = data.get("success_response")
+    if error_response:
+        return False, data
+    if data.get("success") is False:
+        return False, data
+    if success_response and isinstance(success_response, dict):
+        order_id = success_response.get("order_id")
+        if order_id and not data.get("order_id"):
+            data["order_id"] = order_id
+    return True, data
+
+
+def _collect_paginated(path: str, list_key: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+
+    while True:
+        merged: Dict[str, Any] = dict(params or {})
+        if cursor:
+            merged["cursor"] = cursor
+
+        data = _request_get(path, merged)
+        if not isinstance(data, dict):
+            if isinstance(data, list):
+                out.extend(item for item in data if isinstance(item, dict))
+            break
+
+        batch = data.get(list_key)
+        if isinstance(batch, list):
+            out.extend(item for item in batch if isinstance(item, dict))
+
+        pagination = data.get("pagination")
+        next_cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
+        if not next_cursor:
+            break
+        cursor = str(next_cursor)
+
+    return out
 
 
 def get_balances() -> List[Dict[str, Any]]:
-    data = _request_get("/api/v3/brokerage/accounts")
-    if isinstance(data, dict):
-        return data.get("accounts", [])
-    return data if isinstance(data, list) else []
+    return _collect_paginated("/api/v3/brokerage/accounts", "accounts", {"limit": 250})
 
 
 def place_limit_order(
@@ -88,8 +123,8 @@ def place_limit_order(
 ) -> Tuple[bool, Dict[str, Any]]:
     payload = {
         "client_order_id": client_order_id or str(uuid.uuid4()),
-        "product_id": product_id,
-        "side": side.upper(),
+        "product_id": str(product_id).upper(),
+        "side": str(side).upper(),
         "order_configuration": {
             "limit_limit_gtc": {
                 "base_size": str(size),
@@ -109,8 +144,8 @@ def place_market_ioc_order(
 ) -> Tuple[bool, Dict[str, Any]]:
     payload = {
         "client_order_id": client_order_id or str(uuid.uuid4()),
-        "product_id": product_id,
-        "side": side.upper(),
+        "product_id": str(product_id).upper(),
+        "side": str(side).upper(),
         "order_configuration": {
             "market_market_ioc": {
                 "base_size": str(size),
@@ -134,8 +169,8 @@ def place_bracket_order(
         "success": False,
         "error": "not_implemented",
         "message": "Server-side bracket orders are not implemented in this repo.",
-        "product_id": product_id,
-        "side": side,
+        "product_id": str(product_id).upper(),
+        "side": str(side).upper(),
         "size": str(size),
         "limit_price": str(limit_price),
         "tp_price": str(tp_price),
@@ -146,12 +181,24 @@ def place_bracket_order(
 
 
 def cancel_order(order_id: str) -> bool:
-    resp = _request_post("/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
-    if isinstance(resp, dict):
-        results = resp.get("results") or []
-        if results:
-            return bool(results[0].get("success"))
-        return bool(resp.get("success", True))
+    response = _request_post("/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
+    data = _to_dict(response)
+
+    if not isinstance(data, dict):
+        return True
+
+    results = data.get("results")
+    if isinstance(results, list) and results:
+        first = results[0]
+        if isinstance(first, dict):
+            if first.get("success") is not None:
+                return bool(first.get("success"))
+            failure_reason = str(first.get("failure_reason") or "").upper()
+            return failure_reason in {"UNKNOWN_CANCEL_ORDER", "ORDER_ALREADY_FILLED", "ORDER_NOT_FOUND", "ALREADY_CANCELLED"}
+
+    if data.get("success") is not None:
+        return bool(data.get("success"))
+
     return True
 
 
@@ -161,10 +208,10 @@ def get_order_status(order_id: str) -> Dict[str, Any]:
 
 
 def get_open_orders(product_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {"order_status": ["OPEN", "PENDING"]}
+    params: Dict[str, Any] = {
+        "order_status": ["OPEN", "PENDING", "ACTIVE"],
+        "limit": 250,
+    }
     if product_id:
-        params["product_ids"] = [product_id]
-    data = _request_get("/api/v3/brokerage/orders/historical/batch", params)
-    if isinstance(data, dict):
-        return data.get("orders", [])
-    return data if isinstance(data, list) else []
+        params["product_ids"] = [str(product_id).upper()]
+    return _collect_paginated("/api/v3/brokerage/orders/historical/batch", "orders", params)

@@ -1,2 +1,4 @@
 coinbase-advanced-py
 python-dotenv
+requests
+certifi
