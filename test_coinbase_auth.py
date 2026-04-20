@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from broker import coinbase_private as cb_priv  # type: ignore
 from broker import coinbase_public as cb_pub  # type: ignore
@@ -38,9 +38,10 @@ def _candidate_products() -> List[str]:
         "BTC-USD",
         "ETH-USD",
         "BTC-USDC",
-        "USDC-USD",
         "USDT-USD",
         "USDT-USDC",
+        "DAI-USD",
+        "DAI-USDC",
     ]
     for product_id in fallback:
         normalized = product_id.upper()
@@ -49,6 +50,12 @@ def _candidate_products() -> List[str]:
             ordered.append(normalized)
 
     return ordered[:8]
+
+
+def _status_and_label(resp: Dict[str, Any]) -> Tuple[int, str]:
+    status = int(resp.get("_http_status", 200))
+    label = "OK" if 200 <= status < 300 else "FAIL"
+    return status, label
 
 
 def main() -> None:
@@ -75,7 +82,8 @@ def main() -> None:
     for product_id in _candidate_products():
         try:
             preview = _preview_quote_buy(product_id)
-            print(f"{product_id}: OK -> {preview}")
+            status, label = _status_and_label(preview)
+            print(f"{product_id}: {label} (http_status={status}) -> {preview}")
         except Exception as exc:
             print(f"{product_id}: FAIL -> {exc}")
 
