@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlencode
 
 try:
     from dotenv import find_dotenv, load_dotenv  # type: ignore
@@ -11,11 +10,7 @@ try:
 except Exception:
     pass
 
-try:
-    from coinbase.rest import RESTClient  # type: ignore
-except Exception:
-    RESTClient = None  # type: ignore
-
+from . import coinbase_http as cb_http
 
 DEFAULT_EXCLUDED_PRODUCTS: Set[str] = set()
 DEFAULT_REFERENCE_ASSETS: Set[str] = {
@@ -34,37 +29,6 @@ DEFAULT_REFERENCE_ASSETS: Set[str] = {
 ACTIVE_STATUSES = {"online", "active", "internal"}
 
 
-def _sanitize_secret(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return raw
-    s = raw.strip()
-    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
-        s = s[1:-1]
-    return s.replace("\\n", "\n")
-
-
-def _client() -> Optional[RESTClient]:
-    if RESTClient is None:
-        return None
-    timeout = float(os.getenv("CB_SDK_TIMEOUT", "10"))
-    key = os.getenv("COINBASE_API_KEY")
-    secret = _sanitize_secret(os.getenv("COINBASE_API_SECRET"))
-    if key and secret:
-        return RESTClient(api_key=key, api_secret=secret, timeout=timeout)
-    return RESTClient(timeout=timeout)
-
-
-def _to_dict(value: Any) -> Any:
-    try:
-        if hasattr(value, "to_dict"):
-            return value.to_dict()
-        if hasattr(value, "model_dump"):
-            return value.model_dump()
-    except Exception:
-        pass
-    return value
-
-
 def _boolish(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -76,16 +40,18 @@ def _split_csv_env(name: str) -> List[str]:
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
 
 
-def _request_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    client = _client()
-    if client is None:
-        raise RuntimeError("coinbase-advanced-py not installed")
-    full_path = path
-    if params:
-        filtered = {k: v for k, v in params.items() if v is not None and v != ""}
-        if filtered:
-            full_path = f"{path}?{urlencode(filtered, doseq=True)}"
-    return _to_dict(client.get(full_path))
+def _request_public(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    status, data = cb_http.request("GET", path, params=params, auth=False)
+    if 200 <= status < 300:
+        return data
+    raise RuntimeError(f"HTTP {status} for {path}: {data}")
+
+
+def _request_authed(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    status, data = cb_http.request("GET", path, params=params, auth=True)
+    if 200 <= status < 300:
+        return data
+    raise RuntimeError(f"HTTP {status} for {path}: {data}")
 
 
 def _normalize_product(product: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,14 +76,14 @@ def _offline_products() -> List[Dict[str, Any]]:
     return [
         _normalize_product(
             {
-                "product_id": "USDC-USD",
-                "base_currency_id": "USDC",
+                "product_id": "USDT-USD",
+                "base_currency_id": "USDT",
                 "quote_currency_id": "USD",
                 "base_increment": "0.01",
-                "price_increment": "0.0001",
+                "price_increment": "0.00001",
                 "min_order_size": "1",
                 "fx_stablecoin": True,
-                "post_only": True,
+                "post_only": False,
                 "limit_only": False,
                 "cancel_only": False,
                 "trading_disabled": False,
@@ -133,7 +99,39 @@ def _offline_products() -> List[Dict[str, Any]]:
                 "price_increment": "0.0001",
                 "min_order_size": "1",
                 "fx_stablecoin": True,
-                "post_only": True,
+                "post_only": False,
+                "limit_only": False,
+                "cancel_only": False,
+                "trading_disabled": False,
+                "status": "online",
+            }
+        ),
+        _normalize_product(
+            {
+                "product_id": "DAI-USD",
+                "base_currency_id": "DAI",
+                "quote_currency_id": "USD",
+                "base_increment": "0.01",
+                "price_increment": "0.0001",
+                "min_order_size": "1",
+                "fx_stablecoin": True,
+                "post_only": False,
+                "limit_only": False,
+                "cancel_only": False,
+                "trading_disabled": False,
+                "status": "online",
+            }
+        ),
+        _normalize_product(
+            {
+                "product_id": "DAI-USDC",
+                "base_currency_id": "DAI",
+                "quote_currency_id": "USDC",
+                "base_increment": "0.01",
+                "price_increment": "0.0001",
+                "min_order_size": "1",
+                "fx_stablecoin": True,
+                "post_only": False,
                 "limit_only": False,
                 "cancel_only": False,
                 "trading_disabled": False,
@@ -143,7 +141,7 @@ def _offline_products() -> List[Dict[str, Any]]:
     ]
 
 
-def _collect_products(path: str) -> List[Dict[str, Any]]:
+def _collect_products(fetcher, path: str) -> List[Dict[str, Any]]:
     seen: Set[str] = set()
     cursor: Optional[str] = None
     out: List[Dict[str, Any]] = []
@@ -152,9 +150,11 @@ def _collect_products(path: str) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"limit": 250}
         if cursor:
             params["cursor"] = cursor
-        data = _request_get(path, params)
+
+        data = fetcher(path, params)
         products = data.get("products") if isinstance(data, dict) else None
         batch = products if isinstance(products, list) else []
+
         for raw in batch:
             normalized = _normalize_product(raw)
             product_id = normalized.get("product_id")
@@ -172,27 +172,26 @@ def _collect_products(path: str) -> List[Dict[str, Any]]:
 
 
 def get_market_products() -> List[Dict[str, Any]]:
-    client = _client()
-    if client is None:
-        return _offline_products()
     for path in ("/api/v3/brokerage/market/products", "/api/v3/brokerage/products"):
         try:
-            products = _collect_products(path)
+            products = _collect_products(_request_public, path)
             if products:
                 return products
         except Exception:
             continue
-    return []
+    return _offline_products()
 
 
 def get_tradable_products() -> List[Dict[str, Any]]:
-    client = _client()
-    if client is None:
-        return _offline_products()
-    try:
-        return _collect_products("/api/v3/brokerage/products")
-    except Exception:
-        return []
+    if cb_http.has_auth():
+        for path in ("/api/v3/brokerage/products", "/api/v3/brokerage/market/products"):
+            try:
+                products = _collect_products(_request_authed, path)
+                if products:
+                    return products
+            except Exception:
+                continue
+    return get_market_products()
 
 
 def get_products() -> List[Dict[str, Any]]:
@@ -202,20 +201,35 @@ def get_products() -> List[Dict[str, Any]]:
 def get_product(product_id: str) -> Optional[Dict[str, Any]]:
     normalized = str(product_id).upper()
 
-    for product in get_tradable_products():
-        if product.get("product_id") == normalized:
-            return product
-
-    for path in (
+    public_paths = [
+        f"/api/v3/brokerage/market/products/{normalized}",
+        f"/api/v3/brokerage/products/{normalized}",
+    ]
+    authed_paths = [
         f"/api/v3/brokerage/products/{normalized}",
         f"/api/v3/brokerage/market/products/{normalized}",
-    ):
+    ]
+
+    for path in public_paths:
         try:
-            data = _request_get(path)
+            data = _request_public(path)
             if isinstance(data, dict) and data.get("product_id"):
                 return _normalize_product(data)
         except Exception:
             continue
+
+    if cb_http.has_auth():
+        for path in authed_paths:
+            try:
+                data = _request_authed(path)
+                if isinstance(data, dict) and data.get("product_id"):
+                    return _normalize_product(data)
+            except Exception:
+                continue
+
+    for product in get_tradable_products():
+        if product.get("product_id") == normalized:
+            return product
 
     for product in get_market_products():
         if product.get("product_id") == normalized:
@@ -321,7 +335,7 @@ def _validate_products(products: List[str], label: str, tradable_only: bool = Tr
     live_products = {str(p.get("product_id") or "").upper() for p in source}
     missing = [p for p in products if p not in live_products]
     if missing:
-        universe = "tradable brokerage product list" if tradable_only else "market product list"
+        universe = "tradable product list" if tradable_only else "market product list"
         raise RuntimeError(f"Configured {label} not found in Coinbase {universe}: {', '.join(missing)}")
     return products
 
@@ -369,32 +383,18 @@ def _extract_price_size_rows(rows: Any) -> List[List[str]]:
 
 
 def get_best_bid_ask(product_id: str) -> Tuple[Decimal, Decimal]:
-    client = _client()
-    if client is None:
-        return Decimal("0.9999"), Decimal("1.0001")
-
     normalized = str(product_id).upper()
 
     for path, params in (
         (f"/api/v3/brokerage/market/products/{normalized}/ticker", {"limit": 1}),
-        ("/api/v3/brokerage/best_bid_ask", {"product_ids": normalized}),
-        (f"/api/v3/brokerage/products/{normalized}/ticker", None),
+        (f"/api/v3/brokerage/products/{normalized}/ticker", {"limit": 1}),
     ):
         try:
-            data = _request_get(path, params)
-            if path.endswith("/ticker"):
-                bid = data.get("best_bid") or data.get("bid")
-                ask = data.get("best_ask") or data.get("ask")
-                if bid is not None and ask is not None:
-                    return Decimal(str(bid)), Decimal(str(ask))
-            else:
-                books = data.get("pricebooks") if isinstance(data, dict) else []
-                if books:
-                    pricebook = books[0]
-                    bids = _extract_price_size_rows(pricebook.get("bids"))
-                    asks = _extract_price_size_rows(pricebook.get("asks"))
-                    if bids and asks:
-                        return Decimal(bids[0][0]), Decimal(asks[0][0])
+            data = _request_public(path, params)
+            bid = data.get("best_bid") or data.get("bid")
+            ask = data.get("best_ask") or data.get("ask")
+            if bid is not None and ask is not None:
+                return Decimal(str(bid)), Decimal(str(ask))
         except Exception:
             continue
 
@@ -411,10 +411,6 @@ def get_best_bid_ask(product_id: str) -> Tuple[Decimal, Decimal]:
 
 
 def get_l2(product_id: str, depth: int = 5) -> Dict[str, List[List[str]]]:
-    client = _client()
-    if client is None:
-        return {"bids": [["0.9999", "10000"]], "asks": [["1.0001", "10000"]]}
-
     normalized = str(product_id).upper()
     attempts = [
         ("/api/v3/brokerage/market/product_book", {"product_id": normalized, "limit": depth}),
@@ -422,7 +418,7 @@ def get_l2(product_id: str, depth: int = 5) -> Dict[str, List[List[str]]]:
     ]
     for path, params in attempts:
         try:
-            data = _request_get(path, params)
+            data = _request_public(path, params)
             pricebook = data.get("pricebook") if isinstance(data, dict) else None
             source = pricebook if isinstance(pricebook, dict) else data
             if isinstance(source, dict):
@@ -436,11 +432,10 @@ def get_l2(product_id: str, depth: int = 5) -> Dict[str, List[List[str]]]:
 
 
 def get_accounts() -> List[Dict[str, Any]]:
-    client = _client()
-    if client is None:
+    if not cb_http.has_auth():
         return [{"currency": "USD", "available": "1000"}, {"currency": "USDC", "available": "1000"}]
     try:
-        data = _request_get("/api/v3/brokerage/accounts")
+        data = _request_authed("/api/v3/brokerage/accounts")
         if isinstance(data, dict):
             return data.get("accounts", [])
         return data if isinstance(data, list) else []

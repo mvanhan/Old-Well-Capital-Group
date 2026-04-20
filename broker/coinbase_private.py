@@ -1,83 +1,44 @@
 from __future__ import annotations
 
-import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
-try:
-    from dotenv import find_dotenv, load_dotenv  # type: ignore
-    load_dotenv(find_dotenv(), override=False)
-except Exception:
-    pass
-
-try:
-    from coinbase.rest import RESTClient  # type: ignore
-except Exception:
-    RESTClient = None  # type: ignore
-
-
-def _sanitize_secret(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return raw
-    s = raw.strip()
-    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
-        s = s[1:-1]
-    return s.replace("\\n", "\n")
-
-
-def _client() -> RESTClient:
-    if RESTClient is None:
-        raise RuntimeError("coinbase-advanced-py not installed")
-    api_key = os.getenv("COINBASE_API_KEY", "").strip()
-    api_secret = _sanitize_secret(os.getenv("COINBASE_API_SECRET"))
-    if not api_key or not api_secret:
-        raise RuntimeError("COINBASE_API_KEY/SECRET not set")
-    timeout = float(os.getenv("CB_SDK_TIMEOUT", "10"))
-    return RESTClient(api_key=api_key, api_secret=api_secret, timeout=timeout)
-
-
-def _to_dict(value: Any) -> Any:
-    try:
-        if hasattr(value, "to_dict"):
-            return value.to_dict()
-        if hasattr(value, "model_dump"):
-            return value.model_dump()
-    except Exception:
-        pass
-    return value
+from . import coinbase_http as cb_http
 
 
 def _request_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    client = _client()
-    full_path = path
-    if params:
-        filtered = {k: v for k, v in params.items() if v is not None and v != ""}
-        if filtered:
-            full_path = f"{path}?{urlencode(filtered, doseq=True)}"
-    return _to_dict(client.get(full_path))
+    status, data = cb_http.request("GET", path, params=params, auth=True)
+    if 200 <= status < 300:
+        return data
+    raise RuntimeError(f"HTTP {status} for {path}: {data}")
 
 
 def _request_post(path: str, payload: Dict[str, Any]) -> Any:
-    client = _client()
-    return _to_dict(client.post(path, payload))
+    return cb_http.authed_post(path, payload)
 
 
 def _success_and_payload(resp: Any) -> Tuple[bool, Dict[str, Any]]:
-    data = _to_dict(resp)
-    if not isinstance(data, dict):
-        return True, {"raw": data}
+    data = resp if isinstance(resp, dict) else {"raw": resp}
+    http_status = int(data.get("_http_status", 200))
+
+    if http_status < 200 or http_status >= 300:
+        return False, data
 
     error_response = data.get("error_response")
     success_response = data.get("success_response")
+
     if error_response:
         return False, data
     if data.get("success") is False:
         return False, data
+    if data.get("error"):
+        return False, data
+
     if success_response and isinstance(success_response, dict):
         order_id = success_response.get("order_id")
         if order_id and not data.get("order_id"):
             data["order_id"] = order_id
+
     return True, data
 
 
@@ -182,10 +143,11 @@ def place_bracket_order(
 
 def cancel_order(order_id: str) -> bool:
     response = _request_post("/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
-    data = _to_dict(response)
+    data = response if isinstance(response, dict) else {"raw": response}
 
-    if not isinstance(data, dict):
-        return True
+    http_status = int(data.get("_http_status", 200))
+    if http_status < 200 or http_status >= 300:
+        return False
 
     results = data.get("results")
     if isinstance(results, list) and results:

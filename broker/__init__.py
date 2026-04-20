@@ -1,1 +1,1 @@
-__all__ = ["coinbase_private", "coinbase_public"]
+__all__ = ["coinbase_http", "coinbase_private", "coinbase_public"]
