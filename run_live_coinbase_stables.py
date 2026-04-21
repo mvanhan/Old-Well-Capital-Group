@@ -54,6 +54,16 @@ def _now_human() -> str:
     return datetime.fromtimestamp(_now(), tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
 def _load_state() -> Dict[str, Any]:
     if not STATE_PATH.exists():
         return {"stage": "IDLE"}
@@ -67,7 +77,7 @@ def _load_state() -> Dict[str, Any]:
 
 
 def _save_state(state: Dict[str, Any]) -> None:
-    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True))
+    STATE_PATH.write_text(json.dumps(_jsonable(state), indent=2, sort_keys=True))
 
 
 def _append_exec(event: str, details: Dict[str, Any]) -> None:
@@ -75,7 +85,7 @@ def _append_exec(event: str, details: Dict[str, Any]) -> None:
         "ts": str(_now()),
         "ts_human": _now_human(),
         "event": event,
-        "details": json.dumps(details, sort_keys=True),
+        "details": json.dumps(_jsonable(details), sort_keys=True),
     }
     exists = EXEC_LOG.exists()
     with EXEC_LOG.open("a", newline="") as handle:

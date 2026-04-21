@@ -252,20 +252,25 @@ def _compute_size_for_bankroll(
     if entry <= 0:
         return Decimal("0"), target_notional, "bad_entry"
 
-    size = round_size(target_notional / entry, spec.size_increment, mode="down")
+    desired_size = round_size(target_notional / entry, spec.size_increment, mode="down")
     bal_base = balances.get(spec.base, Decimal("0"))
     bal_quote = balances.get(spec.quote, Decimal("0"))
 
     if side == "SELL":
-        size = min(size, round_size(bal_base, spec.size_increment, mode="down"))
+        max_sell = round_size(bal_base, spec.size_increment, mode="down")
+        size = min(desired_size, max_sell)
         if size <= 0:
-            return Decimal("0"), target_notional, "insufficient_balance"
-    else:
-        max_buy = round_size(bal_quote / entry, spec.size_increment, mode="down") if entry > 0 else Decimal("0")
-        size = min(size, max_buy)
-        if size <= 0:
-            return Decimal("0"), target_notional, "insufficient_balance"
+            return Decimal("0"), target_notional, f"insufficient_base_balance asset={spec.base} available={bal_base}"
+        if size < desired_size:
+            return size, target_notional, f"base_balance_limited asset={spec.base} available={bal_base}"
+        return size, target_notional, None
 
+    max_buy = round_size(bal_quote / entry, spec.size_increment, mode="down") if entry > 0 else Decimal("0")
+    size = min(desired_size, max_buy)
+    if size <= 0:
+        return Decimal("0"), target_notional, f"insufficient_quote_balance asset={spec.quote} available={bal_quote}"
+    if size < desired_size:
+        return size, target_notional, f"quote_balance_limited asset={spec.quote} available={bal_quote}"
     return size, target_notional, None
 
 
@@ -514,7 +519,7 @@ def scan_once(cfg: StrategyConfig, balances: Dict[str, Decimal]) -> Tuple[Option
             diag = _diag(
                 product_id,
                 side,
-                "pass",
+                balance_note or "pass",
                 dev_bps=dev_bps,
                 edge_minus_gate_bps=edge_minus_gate,
                 notional=notional,

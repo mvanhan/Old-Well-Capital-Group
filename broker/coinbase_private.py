@@ -116,6 +116,24 @@ def place_market_ioc_order(
     return _success_and_payload(_request_post("/api/v3/brokerage/orders", payload))
 
 
+def place_market_ioc_quote_buy(
+    product_id: str,
+    quote_size: str,
+    client_order_id: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    payload = {
+        "client_order_id": client_order_id or str(uuid.uuid4()),
+        "product_id": str(product_id).upper(),
+        "side": "BUY",
+        "order_configuration": {
+            "market_market_ioc": {
+                "quote_size": str(quote_size),
+            }
+        },
+    }
+    return _success_and_payload(_request_post("/api/v3/brokerage/orders", payload))
+
+
 def place_bracket_order(
     product_id: str,
     side: str,

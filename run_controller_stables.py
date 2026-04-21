@@ -15,10 +15,12 @@ OUTDIR = "output_stables"
 STATE_PATH = os.path.join(OUTDIR, "state.jsonl")
 RESERVE_LOG = os.path.join(OUTDIR, "reserve_actions.csv")
 SUBMITTER_STATE_PATH = os.path.join(OUTDIR, "submitter_state.json")
+RESERVE_TARGETS_PATH = os.path.join(OUTDIR, "reserve_targets.json")
 
 POLL_SECS = int(os.getenv("CONTROLLER_POLL_SECS", "10"))
 PRODUCT_REFRESH_SECS = int(os.getenv("RESERVE_PRODUCT_REFRESH_SECS", "60"))
 RESERVE_ORDER_PREFIX = os.getenv("RESERVE_ORDER_PREFIX", "reserve-")
+RESERVE_REBALANCE_THRESHOLD = Decimal(os.getenv("RESERVE_REBALANCE_THRESHOLD", "0.50"))
 
 DEFAULT_FUNDING_ASSETS = {"USD", "USDC", "USDT", "DAI", "PYUSD", "FDUSD", "USDP", "GUSD", "TUSD", "RLUSD"}
 DEFAULT_TARGET_ASSET_PRIORITY = ["USD", "USDC", "USDT", "DAI", "PYUSD", "FDUSD", "USDP", "GUSD", "TUSD", "RLUSD"]
@@ -81,14 +83,36 @@ def _balances() -> Dict[str, Decimal]:
     return out
 
 
-def _product_map() -> Dict[str, Dict[str, Any]]:
-    return {str(p.get("product_id") or "").upper(): p for p in cb_pub.get_tradable_products() if p.get("product_id")}
+def _product_map(explicit_products: Optional[Sequence[str]] = None) -> Dict[str, Dict[str, Any]]:
+    products: Dict[str, Dict[str, Any]] = {}
+
+    for source in (cb_pub.get_tradable_products(), cb_pub.get_market_products()):
+        for product in source:
+            product_id = str(product.get("product_id") or "").upper()
+            if product_id:
+                products[product_id] = product
+
+    for product_id in explicit_products or []:
+        normalized = str(product_id).upper()
+        if normalized and normalized not in products:
+            fallback = cb_pub.get_product(normalized)
+            if fallback:
+                products[normalized] = fallback
+
+    return products
 
 
 def _base_quote(product_id: str, products: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
-    product = products.get(product_id.upper())
+    normalized = product_id.upper()
+    product = products.get(normalized)
+    if not product:
+        fallback = cb_pub.get_product(normalized)
+        if fallback:
+            products[normalized] = fallback
+            product = fallback
     if not product:
         raise ValueError(f"Unknown product_id {product_id}")
+
     base = str(product.get("base_currency_id") or product.get("base_currency") or "").upper()
     quote = str(product.get("quote_currency_id") or product.get("quote_currency") or "").upper()
     if not base or not quote:
@@ -96,11 +120,40 @@ def _base_quote(product_id: str, products: Dict[str, Dict[str, Any]]) -> Tuple[s
     return base, quote
 
 
-def _min_balance(symbol: str) -> Decimal:
-    specific = os.getenv(f"RESERVE_MIN_{symbol.upper()}", "")
-    if specific.strip():
-        return Decimal(specific)
-    return Decimal(os.getenv("RESERVE_MIN_DEFAULT", "50"))
+def _file_targets() -> Dict[str, Decimal]:
+    if not os.path.exists(RESERVE_TARGETS_PATH):
+        return {}
+    try:
+        with open(RESERVE_TARGETS_PATH) as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return {}
+        out: Dict[str, Decimal] = {}
+        for asset, value in data.items():
+            try:
+                out[str(asset).upper()] = Decimal(str(value))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return {}
+
+
+def _target_min_balances(assets: Set[str]) -> Dict[str, Decimal]:
+    file_targets = _file_targets()
+    default = Decimal(os.getenv("RESERVE_MIN_DEFAULT", "50"))
+    out: Dict[str, Decimal] = {}
+
+    for asset in assets:
+        specific = os.getenv(f"RESERVE_MIN_{asset.upper()}", "").strip()
+        if specific:
+            out[asset] = Decimal(specific)
+        elif asset in file_targets:
+            out[asset] = file_targets[asset]
+        else:
+            out[asset] = default
+
+    return out
 
 
 def _max_topup_unit_usd() -> Decimal:
@@ -155,7 +208,11 @@ def _submit_limit(
 ) -> Optional[Tuple[str, Decimal, Decimal]]:
     product = products.get(product_id.upper())
     if not product:
-        return None
+        fallback = cb_pub.get_product(product_id.upper())
+        if not fallback:
+            return None
+        products[product_id.upper()] = fallback
+        product = fallback
 
     price_inc = q(product.get("price_increment") or product.get("quote_increment") or "0.0001")
     base_inc = q(product.get("base_increment") or "0.01")
@@ -215,32 +272,35 @@ def _refresh_products_if_due(current_products: List[str], last_refresh_ts: int) 
 def _asset_set(products: List[str], product_map: Dict[str, Dict[str, Any]]) -> Set[str]:
     assets: Set[str] = set()
     for product_id in products:
-        product = product_map.get(product_id.upper())
-        if not product:
+        try:
+            product = product_map.get(product_id.upper()) or cb_pub.get_product(product_id.upper())
+            if not product:
+                continue
+            base = str(product.get("base_currency_id") or product.get("base_currency") or "").upper()
+            quote = str(product.get("quote_currency_id") or product.get("quote_currency") or "").upper()
+            if base:
+                assets.add(base)
+            if quote:
+                assets.add(quote)
+        except Exception:
             continue
-        base = str(product.get("base_currency_id") or product.get("base_currency") or "").upper()
-        quote = str(product.get("quote_currency_id") or product.get("quote_currency") or "").upper()
-        if base:
-            assets.add(base)
-        if quote:
-            assets.add(quote)
     return assets
 
 
-def _asset_shortfalls(assets: Set[str], balances: Dict[str, Decimal]) -> List[Tuple[str, Decimal]]:
+def _asset_shortfalls(assets: Set[str], balances: Dict[str, Decimal], targets: Dict[str, Decimal]) -> List[Tuple[str, Decimal]]:
     priority = {asset: idx for idx, asset in enumerate(_target_asset_priority())}
     rows: List[Tuple[str, Decimal]] = []
     for asset in assets:
-        shortfall = _min_balance(asset) - balances.get(asset, Decimal("0"))
-        if shortfall > 0:
+        shortfall = targets.get(asset, Decimal("0")) - balances.get(asset, Decimal("0"))
+        if shortfall > RESERVE_REBALANCE_THRESHOLD:
             rows.append((asset, shortfall))
 
     rows.sort(key=lambda item: (priority.get(item[0], 999), -item[1], item[0]))
     return rows
 
 
-def _source_excess(asset: str, balances: Dict[str, Decimal]) -> Decimal:
-    return balances.get(asset, Decimal("0")) - _min_balance(asset)
+def _source_excess(asset: str, balances: Dict[str, Decimal], targets: Dict[str, Decimal]) -> Decimal:
+    return balances.get(asset, Decimal("0")) - targets.get(asset, Decimal("0"))
 
 
 def _buy_candidate(
@@ -249,12 +309,13 @@ def _buy_candidate(
     target_shortfall: Decimal,
     balances: Dict[str, Decimal],
     products: Dict[str, Dict[str, Any]],
+    targets: Dict[str, Decimal],
 ) -> Optional[Dict[str, Any]]:
     base, quote = _base_quote(product_id, products)
     if base != target_asset:
         return None
 
-    available_quote = _source_excess(quote, balances)
+    available_quote = _source_excess(quote, balances, targets)
     if available_quote <= 0:
         return None
 
@@ -269,6 +330,9 @@ def _buy_candidate(
     quote_needed = target_shortfall * price
     quote_notional = min(max_quote, quote_needed)
     if quote_notional <= 0:
+        return None
+
+    if quote_notional <= RESERVE_REBALANCE_THRESHOLD:
         return None
 
     return {
@@ -287,12 +351,13 @@ def _sell_candidate(
     target_shortfall: Decimal,
     balances: Dict[str, Decimal],
     products: Dict[str, Dict[str, Any]],
+    targets: Dict[str, Decimal],
 ) -> Optional[Dict[str, Any]]:
     base, quote = _base_quote(product_id, products)
     if quote != target_asset:
         return None
 
-    available_base = _source_excess(base, balances)
+    available_base = _source_excess(base, balances, targets)
     if available_base <= 0:
         return None
 
@@ -303,6 +368,9 @@ def _sell_candidate(
     base_capacity_quote = available_base * price
     quote_notional = min(_max_topup_unit_usd(), target_shortfall, base_capacity_quote)
     if quote_notional <= 0:
+        return None
+
+    if quote_notional <= RESERVE_REBALANCE_THRESHOLD:
         return None
 
     return {
@@ -327,19 +395,20 @@ def _reserve_actions(
     balances: Dict[str, Decimal],
     busy_products: List[str],
     reserve_products: List[str],
-) -> List[str]:
+) -> Tuple[List[str], Dict[str, Decimal]]:
     actions: List[str] = []
     busy = {product.upper() for product in busy_products}
-    products = _product_map()
+    products = _product_map(reserve_products)
     funding_assets = _funding_assets()
     tracked_assets = _asset_set(reserve_products, products)
+    targets = _target_min_balances(tracked_assets)
 
     if not tracked_assets:
-        return actions
+        return actions, targets
 
-    shortfalls = _asset_shortfalls(tracked_assets, balances)
+    shortfalls = _asset_shortfalls(tracked_assets, balances, targets)
     if not shortfalls:
-        return actions
+        return actions, targets
 
     for target_asset, target_shortfall in shortfalls:
         candidates: List[Dict[str, Any]] = []
@@ -348,13 +417,16 @@ def _reserve_actions(
             if normalized in busy or _reserve_order_open(normalized):
                 continue
 
-            buy_candidate = _buy_candidate(normalized, target_asset, target_shortfall, balances, products)
-            if buy_candidate:
-                candidates.append(buy_candidate)
+            try:
+                buy_candidate = _buy_candidate(normalized, target_asset, target_shortfall, balances, products, targets)
+                if buy_candidate:
+                    candidates.append(buy_candidate)
 
-            sell_candidate = _sell_candidate(normalized, target_asset, target_shortfall, balances, products)
-            if sell_candidate:
-                candidates.append(sell_candidate)
+                sell_candidate = _sell_candidate(normalized, target_asset, target_shortfall, balances, products, targets)
+                if sell_candidate:
+                    candidates.append(sell_candidate)
+            except Exception:
+                continue
 
         candidates.sort(key=lambda candidate: _candidate_rank(candidate, funding_assets))
         for candidate in candidates:
@@ -374,9 +446,9 @@ def _reserve_actions(
                 f"size={size} price={price} target={candidate['target_asset']} "
                 f"source={candidate['source_asset']} order_id={order_id}"
             )
-            return actions
+            return actions, targets
 
-    return actions
+    return actions, targets
 
 
 def main() -> None:
@@ -399,12 +471,13 @@ def main() -> None:
 
             balances = _balances()
             busy_products = _busy_products()
-            actions = _reserve_actions(balances, busy_products, reserve_products)
+            actions, targets = _reserve_actions(balances, busy_products, reserve_products)
 
             state_row = {
                 "ts": _now(),
                 "products": reserve_products,
                 "busy_products": busy_products,
+                "targets": {k: str(v) for k, v in targets.items()},
                 "balances": {k: str(v) for k, v in balances.items()},
                 "actions": actions,
             }

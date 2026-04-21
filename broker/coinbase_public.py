@@ -330,13 +330,40 @@ def get_fee_eligible_stable_products() -> List[Dict[str, Any]]:
     return out
 
 
+def _combined_live_product_ids() -> Set[str]:
+    live_products: Set[str] = set()
+
+    for source in (get_tradable_products(), get_market_products()):
+        for product in source:
+            product_id = str(product.get("product_id") or "").upper()
+            if product_id:
+                live_products.add(product_id)
+
+    return live_products
+
+
 def _validate_products(products: List[str], label: str, tradable_only: bool = True) -> List[str]:
-    source = get_tradable_products() if tradable_only else get_market_products()
-    live_products = {str(p.get("product_id") or "").upper() for p in source}
-    missing = [p for p in products if p not in live_products]
+    live_products = _combined_live_product_ids() if tradable_only else {
+        str(p.get("product_id") or "").upper() for p in get_market_products()
+    }
+
+    missing: List[str] = []
+    for product_id in products:
+        normalized = product_id.upper()
+        if normalized in live_products:
+            continue
+
+        product = get_product(normalized)
+        if product is not None:
+            live_products.add(normalized)
+            continue
+
+        missing.append(normalized)
+
     if missing:
-        universe = "tradable product list" if tradable_only else "market product list"
-        raise RuntimeError(f"Configured {label} not found in Coinbase {universe}: {', '.join(missing)}")
+        universe = "Coinbase live product universe" if tradable_only else "Coinbase market product list"
+        raise RuntimeError(f"Configured {label} not found in {universe}: {', '.join(missing)}")
+
     return products
 
 
