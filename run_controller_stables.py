@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import os
 import time
@@ -12,8 +11,6 @@ from broker import coinbase_public as cb_pub  # type: ignore
 from owcg_utils.precision import round_price, round_size
 
 OUTDIR = "output_stables"
-STATE_PATH = os.path.join(OUTDIR, "state.jsonl")
-RESERVE_LOG = os.path.join(OUTDIR, "reserve_actions.csv")
 SUBMITTER_STATE_PATH = os.path.join(OUTDIR, "submitter_state.json")
 RESERVE_TARGETS_PATH = os.path.join(OUTDIR, "reserve_targets.json")
 
@@ -42,26 +39,6 @@ def _env_list(name: str, default: Sequence[str]) -> List[str]:
     if not raw.strip():
         return [str(item).upper() for item in default]
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
-
-
-def _ensure_outdir() -> None:
-    os.makedirs(OUTDIR, exist_ok=True)
-
-
-def _write_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    _ensure_outdir()
-    with open(path, "a") as handle:
-        handle.write(json.dumps(obj) + "\n")
-
-
-def _append_csv(path: str, row: Dict[str, str]) -> None:
-    _ensure_outdir()
-    exists = os.path.exists(path)
-    with open(path, "a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 def _now() -> int:
@@ -452,8 +429,6 @@ def _reserve_actions(
 
 
 def main() -> None:
-    _ensure_outdir()
-
     reserve_products: List[str] = []
     last_refresh_ts = 0
 
@@ -471,26 +446,14 @@ def main() -> None:
 
             balances = _balances()
             busy_products = _busy_products()
-            actions, targets = _reserve_actions(balances, busy_products, reserve_products)
-
-            state_row = {
-                "ts": _now(),
-                "products": reserve_products,
-                "busy_products": busy_products,
-                "targets": {k: str(v) for k, v in targets.items()},
-                "balances": {k: str(v) for k, v in balances.items()},
-                "actions": actions,
-            }
-            _write_jsonl(STATE_PATH, state_row)
+            actions, _ = _reserve_actions(balances, busy_products, reserve_products)
 
             if actions:
-                _append_csv(RESERVE_LOG, {"ts": str(state_row["ts"]), "actions": " | ".join(actions)})
                 print(f"[controller] {' | '.join(actions)}")
         except KeyboardInterrupt:
             print("[controller] stopping")
             break
         except Exception as exc:
-            _write_jsonl(STATE_PATH, {"ts": _now(), "error": str(exc)})
             print(f"[controller] error: {exc}")
         finally:
             time.sleep(POLL_SECS)

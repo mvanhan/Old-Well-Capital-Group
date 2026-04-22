@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import time
-from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,29 +18,11 @@ from broker import coinbase_public as cb_pub  # type: ignore
 from strategies.stables_mean_reversion import StrategyConfig, scan_once
 
 OUTDIR = "output_stables"
-CSV_SCANS_LATEST = os.path.join(OUTDIR, "screen_latest.csv")
-CSV_SCANS_HISTORY = os.path.join(OUTDIR, "screen_history.csv")
 CSV_TICKET_LATEST = os.path.join(OUTDIR, "trade_tickets_latest.csv")
-CSV_TICKET_HISTORY = os.path.join(OUTDIR, "trade_tickets_history.csv")
 SUBMITTER_STATE = os.path.join(OUTDIR, "submitter_state.json")
 
 INTERVAL_SECS = int(os.getenv("STABLES_SCAN_INTERVAL", "15"))
 PRODUCT_REFRESH_SECS = int(os.getenv("STABLES_PRODUCT_REFRESH_SECS", "60"))
-
-SCAN_HEADER = [
-    "ts",
-    "ts_human",
-    "product_id",
-    "side",
-    "reason",
-    "dev_bps",
-    "edge_minus_gate_bps",
-    "notional",
-    "gate_bps",
-    "depth_note",
-    "risk_dollars",
-    "spread_bps",
-]
 
 TICKET_HEADER = [
     "ticket_id",
@@ -92,11 +73,6 @@ def _ts() -> int:
     return int(time.time())
 
 
-def _ts_human(ts: Optional[int] = None) -> str:
-    stamp = ts or _ts()
-    return datetime.fromtimestamp(stamp, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
 def _ensure_outdir() -> None:
     os.makedirs(OUTDIR, exist_ok=True)
 
@@ -105,15 +81,6 @@ def _write_latest(path: str, row: Dict[str, Any], header: List[str]) -> None:
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=header)
         writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in header})
-
-
-def _append_history(path: str, row: Dict[str, Any], header: List[str]) -> None:
-    exists = os.path.exists(path)
-    with open(path, "a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=header)
-        if not exists:
-            writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in header})
 
 
@@ -198,25 +165,6 @@ def _print_universe(products: List[str]) -> None:
     print(f"[stables] trading universe ({len(products)}): {', '.join(products)}")
 
 
-def _write_no_signal_diag(reason: str) -> None:
-    diag_row = {
-        "ts": _ts(),
-        "ts_human": _ts_human(),
-        "product_id": "",
-        "side": "NONE",
-        "reason": reason,
-        "dev_bps": "0",
-        "edge_minus_gate_bps": "0",
-        "notional": "0",
-        "gate_bps": "0",
-        "depth_note": "n/a",
-        "risk_dollars": "0",
-        "spread_bps": "0",
-    }
-    _write_latest(CSV_SCANS_LATEST, diag_row, SCAN_HEADER)
-    _append_history(CSV_SCANS_HISTORY, diag_row, SCAN_HEADER)
-
-
 def main() -> None:
     _ensure_outdir()
 
@@ -230,7 +178,6 @@ def main() -> None:
         print(f"[stables] startup product resolution failed: {exc}")
 
     while True:
-        loop_started = _ts()
         try:
             products, last_refresh_ts, refresh_note = _refresh_products_if_due(products, last_refresh_ts)
             if refresh_note:
@@ -241,22 +188,16 @@ def main() -> None:
                     print(f"[stables] {refresh_note}")
 
             if not products:
-                _write_no_signal_diag("no_products")
                 print("[stables] no products resolved")
             else:
                 balances = _balances()
                 cfg = _build_cfg(products)
                 ticket, diag = scan_once(cfg, balances=balances)
 
-                diag_row = {"ts": loop_started, "ts_human": _ts_human(loop_started), **diag}
-                _write_latest(CSV_SCANS_LATEST, diag_row, SCAN_HEADER)
-                _append_history(CSV_SCANS_HISTORY, diag_row, SCAN_HEADER)
-
                 if ticket and not _submitter_busy():
                     row = {**ticket.to_row(), "reason": "pass"}
                     row["ticket_id"] = _ticket_id(row)
                     _write_latest(CSV_TICKET_LATEST, row, TICKET_HEADER)
-                    _append_history(CSV_TICKET_HISTORY, row, TICKET_HEADER)
                     print(
                         f"[stables] signal {ticket.side} {ticket.product_id} "
                         f"sz={ticket.size} @ {ticket.entry_price} tp={ticket.tp_price} sl={ticket.sl_price} exp={ticket.expire_ts}"
@@ -270,7 +211,6 @@ def main() -> None:
             print("[stables] stopping")
             break
         except Exception as exc:
-            _write_no_signal_diag(f"scanner_error {exc}")
             print(f"[stables] error: {exc}")
         finally:
             time.sleep(INTERVAL_SECS)
