@@ -1,3 +1,6 @@
 python test_coinbase_auth.py
 python test_coinbase_raw_http.py
 python run_bot_stables.py
+
+python summarize_closed_trades_all_time.py
+python summarize_closed_trades_24h.py

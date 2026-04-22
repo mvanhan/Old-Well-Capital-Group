@@ -20,6 +20,17 @@ except Exception:
 from broker import coinbase_private as cb_priv  # type: ignore
 from broker import coinbase_public as cb_pub  # type: ignore
 from owcg_utils.precision import round_price, round_size
+from strategies.stables_mean_reversion import (
+    StrategyConfig,
+    _enforce_min_tick_separation,
+    _gate_bps,
+    _get_best_bid_ask,
+    _get_product_spec,
+    _gross_dev_bps,
+    _maker_entry_price,
+    _quote_reference_price,
+    _spread_bps,
+)
 
 OUTDIR = Path("output_stables")
 OUTDIR.mkdir(exist_ok=True)
@@ -121,6 +132,133 @@ def _load_ticket() -> Optional[Dict[str, str]]:
 def _clear_ticket_file() -> None:
     if TICKET_PATH.exists():
         TICKET_PATH.unlink()
+
+
+def _build_strategy_cfg() -> StrategyConfig:
+    return StrategyConfig(
+        products=[],
+        out_dir=str(OUTDIR),
+        maker_fee_bps=Decimal(os.getenv("MAKER_FEE_BPS", "0.0")),
+        taker_fee_bps=Decimal(os.getenv("TAKER_FEE_BPS", "0.0")),
+        exit_bps=Decimal(os.getenv("EXIT_BPS", "4.0")),
+        sl_bps=Decimal(os.getenv("SL_BPS", "6.0")),
+        slippage_bps=Decimal(os.getenv("SLIPPAGE_BPS", "1.0")),
+        cushion_bps=Decimal(os.getenv("CUSHION_BPS", "0.3")),
+        hold_minutes=int(os.getenv("HOLD_MINUTES", "180")),
+        depth_ticks=int(os.getenv("DEPTH_TICKS", "2")),
+        min_depth_multiplier=Decimal(os.getenv("MIN_DEPTH_MULTIPLIER", "1.10")),
+        block_on_missing_l2=_boolish(os.getenv("BLOCK_ON_MISSING_L2", "1")),
+        bankroll_usd=Decimal(os.getenv("BANKROLL_USD", "100")),
+        bankroll_pct=Decimal(os.getenv("BANKROLL_PCT", "0.10")),
+        min_notional=Decimal(os.getenv("MIN_NOTIONAL", "5")),
+        max_notional=Decimal(os.getenv("MAX_NOTIONAL", "500")),
+        max_risk_usd=Decimal(os.getenv("MAX_RISK_USD", "3")),
+        min_tp_ticks=int(os.getenv("MIN_TP_TICKS", "1")),
+        min_sl_ticks=int(os.getenv("MIN_SL_TICKS", "1")),
+        max_spread_bps=Decimal(os.getenv("MAX_SPREAD_BPS", "3.0")),
+        max_dev_bps=Decimal(os.getenv("MAX_DEV_BPS", "25.0")),
+        ticket_ttl_secs=int(os.getenv("MAX_TICKET_AGE_SECS", "30")),
+    )
+
+
+def _refresh_ticket_if_edge_valid(ticket: Dict[str, str]) -> Tuple[Optional[Dict[str, str]], Dict[str, Any]]:
+    product_id = ticket["product_id"]
+    side = ticket["side"].upper()
+    cfg = _build_strategy_cfg()
+    spec = _get_product_spec(product_id)
+    reference = _quote_reference_price(spec)
+
+    if reference is None:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": f"unsupported_quote_reference base={spec.base} quote={spec.quote}",
+        }
+
+    bid, ask = _get_best_bid_ask(product_id)
+    if bid <= 0 or ask <= 0 or bid >= ask:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": f"bad_quote bid={bid} ask={ask}",
+        }
+
+    spread = _spread_bps(bid, ask)
+    if spread > cfg.max_spread_bps:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": f"spread_too_wide {spread}",
+            "spread_bps": str(spread),
+        }
+
+    entry = _maker_entry_price(side, bid, ask, spec)
+    dev_bps = _gross_dev_bps(reference, entry, side)
+    if dev_bps <= 0:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": "no_deviation",
+            "spread_bps": str(spread),
+        }
+
+    if dev_bps > cfg.max_dev_bps:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": f"dev_too_large {dev_bps}",
+            "dev_bps": str(dev_bps),
+            "spread_bps": str(spread),
+        }
+
+    gate = _gate_bps(cfg, bid, ask)
+    edge_minus_gate = dev_bps - gate
+    if edge_minus_gate <= 0:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": f"edge_not_met {edge_minus_gate}",
+            "dev_bps": str(dev_bps),
+            "edge_minus_gate_bps": str(edge_minus_gate),
+            "gate_bps": str(gate),
+            "spread_bps": str(spread),
+        }
+
+    size = round_size(q(ticket["size"]), spec.size_increment, mode="down")
+    if size < spec.min_size:
+        return None, {
+            "product_id": product_id,
+            "side": side,
+            "reason": f"size_below_min {size}",
+        }
+
+    if side == "BUY":
+        tp = entry * (Decimal("1") + cfg.exit_bps / Decimal("10000"))
+        sl = entry * (Decimal("1") - cfg.sl_bps / Decimal("10000"))
+    else:
+        tp = entry * (Decimal("1") - cfg.exit_bps / Decimal("10000"))
+        sl = entry * (Decimal("1") + cfg.sl_bps / Decimal("10000"))
+
+    tp, sl = _enforce_min_tick_separation(side, entry, tp, sl, spec, cfg)
+
+    refreshed = dict(ticket)
+    refreshed["entry_price"] = str(entry)
+    refreshed["size"] = str(size)
+    refreshed["tp_price"] = str(tp)
+    refreshed["sl_price"] = str(sl)
+
+    return refreshed, {
+        "product_id": product_id,
+        "side": side,
+        "reason": "pass",
+        "dev_bps": str(dev_bps),
+        "edge_minus_gate_bps": str(edge_minus_gate),
+        "gate_bps": str(gate),
+        "spread_bps": str(spread),
+        "refreshed_entry_price": str(entry),
+        "refreshed_tp_price": str(tp),
+        "refreshed_sl_price": str(sl),
+    }
 
 
 def _product_specs(product_id: str) -> Tuple[Decimal, Decimal, Decimal]:
@@ -506,7 +644,18 @@ def _handle_idle(state: Dict[str, Any]) -> Dict[str, Any]:
         _clear_ticket_file()
         return _idle_state(state.get("last_completed_ticket_id", ""))
 
-    normalized_ticket, parent_resp = _submit_parent_from_ticket(ticket)
+    try:
+        refreshed_ticket, refresh_diag = _refresh_ticket_if_edge_valid(ticket)
+    except Exception as exc:
+        _append_exec("ticket_revalidation_error", {"ticket_id": ticket_id, "error": str(exc), "ticket": ticket})
+        return state
+
+    if not refreshed_ticket:
+        _append_exec("ticket_revalidation_failed", {"ticket_id": ticket_id, "ticket": ticket, **refresh_diag})
+        _clear_ticket_file()
+        return _idle_state(state.get("last_completed_ticket_id", ""))
+
+    normalized_ticket, parent_resp = _submit_parent_from_ticket(refreshed_ticket)
     new_state = _new_parent_state(normalized_ticket, ticket_id, parent_resp)
     _save_state(new_state)
     _clear_ticket_file()

@@ -15,7 +15,18 @@ except Exception:
     pass
 
 from broker import coinbase_public as cb_pub  # type: ignore
-from strategies.stables_mean_reversion import StrategyConfig, scan_once
+from strategies.stables_mean_reversion import (
+    StrategyConfig,
+    _compute_size_for_bankroll,
+    _gate_bps,
+    _get_best_bid_ask,
+    _get_product_spec,
+    _gross_dev_bps,
+    _maker_entry_price,
+    _quote_reference_price,
+    _spread_bps,
+    scan_once,
+)
 
 OUTDIR = "output_stables"
 CSV_TICKET_LATEST = os.path.join(OUTDIR, "trade_tickets_latest.csv")
@@ -161,8 +172,148 @@ def _refresh_products_if_due(
     return refreshed, now, None
 
 
+def _fmt_decimal(value: Any, places: int = 6) -> str:
+    try:
+        dec = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:
+        return str(value)
+
+    quant = Decimal("1").scaleb(-places)
+    text = format(dec.quantize(quant), "f")
+    text = text.rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def _side_diag(
+    product_id: str,
+    side: str,
+    cfg: StrategyConfig,
+    balances: Dict[str, Decimal],
+) -> Dict[str, str]:
+    spec = _get_product_spec(product_id)
+    reference = _quote_reference_price(spec)
+
+    if reference is None:
+        return {
+            "side": side,
+            "reason": f"unsupported_quote_reference base={spec.base} quote={spec.quote}",
+            "entry": "",
+            "dev_bps": "",
+            "gate_bps": "",
+            "edge_bps": "",
+            "size": "",
+            "notional": "",
+            "spread_bps": "",
+        }
+
+    bid, ask = _get_best_bid_ask(product_id)
+    if bid <= 0 or ask <= 0 or bid >= ask:
+        return {
+            "side": side,
+            "reason": f"bad_quote bid={bid} ask={ask}",
+            "entry": "",
+            "dev_bps": "",
+            "gate_bps": "",
+            "edge_bps": "",
+            "size": "",
+            "notional": "",
+            "spread_bps": "",
+        }
+
+    spread = _spread_bps(bid, ask)
+    entry = _maker_entry_price(side, bid, ask, spec)
+    dev_bps = _gross_dev_bps(reference, entry, side)
+    gate = _gate_bps(cfg, bid, ask)
+    edge = dev_bps - gate
+
+    size_str = ""
+    notional_str = ""
+    reason = "pass"
+
+    if spread > cfg.max_spread_bps:
+        reason = f"spread_too_wide {_fmt_decimal(spread)}"
+    elif dev_bps <= 0:
+        reason = "no_deviation"
+    elif dev_bps > cfg.max_dev_bps:
+        reason = f"dev_too_large {_fmt_decimal(dev_bps)}"
+    else:
+        try:
+            size, _, balance_note = _compute_size_for_bankroll(spec, side, entry, cfg, balances)
+            notional = entry * size
+            size_str = _fmt_decimal(size, 8)
+            notional_str = _fmt_decimal(notional, 2)
+            if balance_note:
+                reason = balance_note
+        except Exception as exc:
+            reason = f"size_error {exc}"
+
+    return {
+        "side": side,
+        "reason": reason,
+        "entry": _fmt_decimal(entry, 8),
+        "dev_bps": _fmt_decimal(dev_bps, 6),
+        "gate_bps": _fmt_decimal(gate, 6),
+        "edge_bps": _fmt_decimal(edge, 6),
+        "size": size_str,
+        "notional": notional_str,
+        "spread_bps": _fmt_decimal(spread, 6),
+    }
+
+
 def _print_universe(products: List[str]) -> None:
     print(f"[stables] trading universe ({len(products)}): {', '.join(products)}")
+
+
+def _print_universe_snapshot(products: List[str], balances: Dict[str, Decimal]) -> None:
+    if not products:
+        print("[stables] universe snapshot: no products")
+        return
+
+    cfg = _build_cfg(products)
+    print(f"[stables] universe snapshot ({len(products)} products)")
+
+    ranked_rows: List[Tuple[Decimal, str]] = []
+
+    for product_id in products:
+        try:
+            spec = _get_product_spec(product_id)
+            buy = _side_diag(product_id, "BUY", cfg, balances)
+            sell = _side_diag(product_id, "SELL", cfg, balances)
+
+            buy_edge = Decimal(buy["edge_bps"]) if buy["edge_bps"] else Decimal("-1000000")
+            sell_edge = Decimal(sell["edge_bps"]) if sell["edge_bps"] else Decimal("-1000000")
+
+            if buy_edge >= sell_edge:
+                best_side = "BUY"
+                best = buy
+                best_edge = buy_edge
+            else:
+                best_side = "SELL"
+                best = sell
+                best_edge = sell_edge
+
+            line = (
+                f"[stables] universe-detail {product_id} "
+                f"base={spec.base} quote={spec.quote} "
+                f"best_side={best_side} "
+                f"best_edge_bps={best.get('edge_bps', '')} "
+                f"best_reason={best.get('reason', '')} "
+                f"spread_bps={best.get('spread_bps', '')} "
+                f"buy_edge_bps={buy.get('edge_bps', '')} "
+                f"buy_reason={buy.get('reason', '')} "
+                f"sell_edge_bps={sell.get('edge_bps', '')} "
+                f"sell_reason={sell.get('reason', '')} "
+                f"best_entry={best.get('entry', '')} "
+                f"best_size={best.get('size', '')} "
+                f"best_notional={best.get('notional', '')}"
+            )
+            ranked_rows.append((best_edge, line))
+        except Exception as exc:
+            ranked_rows.append((Decimal("-1000000"), f"[stables] universe-detail {product_id} error={exc}"))
+
+    ranked_rows.sort(key=lambda item: item[0], reverse=True)
+    for _, line in ranked_rows:
+        print(line)
 
 
 def main() -> None:
@@ -170,6 +321,7 @@ def main() -> None:
 
     products: List[str] = []
     last_refresh_ts = 0
+    printed_initial_snapshot = False
 
     try:
         products, last_refresh_ts, _ = _refresh_products_if_due([], 0)
@@ -180,10 +332,13 @@ def main() -> None:
     while True:
         try:
             products, last_refresh_ts, refresh_note = _refresh_products_if_due(products, last_refresh_ts)
+            snapshot_requested = False
+
             if refresh_note:
                 if refresh_note.startswith("universe_updated:"):
                     print(f"[stables] {refresh_note}")
                     _print_universe(products)
+                    snapshot_requested = True
                 else:
                     print(f"[stables] {refresh_note}")
 
@@ -191,6 +346,11 @@ def main() -> None:
                 print("[stables] no products resolved")
             else:
                 balances = _balances()
+
+                if not printed_initial_snapshot or snapshot_requested:
+                    _print_universe_snapshot(products, balances)
+                    printed_initial_snapshot = True
+
                 cfg = _build_cfg(products)
                 ticket, diag = scan_once(cfg, balances=balances)
 
