@@ -1,0 +1,8 @@
+Hi Miller,
+
+This is a test file created by Claude Code to confirm I can create files in this
+project folder and push changes to the GitHub repo (mvanhan/Old-Well-Capital-Group).
+
+If you're reading this on GitHub, the connection is working end-to-end.
+
+— Claude
